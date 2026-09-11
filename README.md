@@ -71,7 +71,12 @@ cloud-init schreibt keine Netzwerkkonfiguration mehr
 AHV-Datasource eine `50-cloud-init.yaml` anlegen, die gegen `10-` gewinnt.
 
 Gibt es im Zielsegment kein DHCP, hängt der Klon nach dem Erstboot ohne Adresse
-da und braucht einmalig die Hypervisor-Konsole.
+da und braucht einmalig die Hypervisor-Konsole. Damit dort niemand suchen muss,
+schreibt `civitas-firstboot` den nötigen Aufruf nach `/etc/issue` — er steht dann
+direkt über dem Login-Prompt. Wichtig für den, der ihn abtippt: **alles in einer
+Zeile**, ohne Backslash. Über eine Hypervisor-Konsole überleben mehrzeilige
+Befehle das Einfügen fast nie, und ein escaptes Leerzeichen führt zu der
+irreführenden Meldung `Unbekannte Option:  --ip`.
 
 ## Warum der Klon hält
 
@@ -140,6 +145,20 @@ eintragen, dann ist das Image bit-genau wiederholbar.
   und bricht ab, wenn sie schon jemandem gehört.
 * **Kaputtes Netplan-YAML.** Vor `netplan apply` läuft `netplan generate`; schlägt
   es fehl, wird die Datei zurückgenommen, statt die VM offline zu nehmen.
+* **`/run/sshd` fehlt nach dem Klonen.** `/run` liegt auf tmpfs, und sshd legt das
+  Verzeichnis erst beim Start an. Da `civitas-firstboot` die Host-Keys entfernt,
+  startet der Dienst vorher nie — `sshd -t` scheitert dann mit
+  `Missing privilege separation directory`. `25-postclone-setup.sh` legt es an.
+* **Teilfehler brechen nicht mehr alles ab.** Scheitert der SSH- oder k3s-Schritt,
+  bleiben Netzwerk und Hostname trotzdem gesetzt; das Skript meldet, was offen ist,
+  und kann nach der Behebung einfach erneut laufen.
+* **Systemzeit.** Nach einem Snapshot-Restore geht die Uhr oft falsch, und k3s lehnt
+  dann seine eigenen Zertifikate ab — sichtbar als API, die nie `readyz` meldet.
+  `20-sysprep-template.sh` warnt vorab, `25-postclone-setup.sh` zeigt es in der
+  Diagnose an.
+* **`10-build-template.sh` nicht über eine nackte SSH-Sitzung laufen lassen.**
+  `apt-get upgrade` arbeitet minutenlang ohne Ausgabe; reißt die Verbindung ab,
+  bleibt dpkg auf halbem Weg stehen. Das Skript warnt und empfiehlt `tmux`.
 
 ## Varianten beim Sysprep
 

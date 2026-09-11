@@ -41,6 +41,11 @@ DNS=""
 IFACE=""
 USE_DHCP=false
 CHECK_ONLY=false
+SKIP_K3S=false
+
+# Teilschritte duerfen scheitern, ohne den Rest zu verhindern.
+SSH_BROKEN=false
+K3S_BROKEN=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --iface)    IFACE="${2:?}";        shift 2 ;;
     --dhcp)     USE_DHCP=true;         shift ;;
     --check)    CHECK_ONLY=true;       shift ;;
+    --skip-k3s) SKIP_K3S=true;         shift ;;
     -h|--help)  sed -n '2,30p' "$0"; exit 0 ;;
     *)          die "Unbekannte Option: $1" ;;
   esac
@@ -215,75 +221,141 @@ CURRENT_IP=$(primary_ip)
 # 4 – SSH-Host-Keys sicherstellen
 # ---------------------------------------------------------------------------
 
-log "SSH-Host-Keys pruefen"
+log "SSH pruefen"
+
+# /run liegt auf tmpfs und ist nach jedem Boot leer. sshd legt das
+# Privilege-Separation-Verzeichnis beim Start selbst an - wurde der Dienst
+# nach dem Klonen aber noch nie gestartet (civitas-firstboot entfernt die
+# Host-Keys, ohne sie fehlt sshd der Start), existiert es nicht, und
+# "sshd -t" bricht mit "Missing privilege separation directory" ab.
+install -d -m 0755 -o root -g root /run/sshd
+
 if ! ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
   ssh-keygen -A
-  sshd -t || die "sshd-Konfiguration fehlerhaft."
-  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-  ok "neu erzeugt"
+  ok "Host-Keys neu erzeugt"
 else
-  ok "vorhanden ($(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | awk '{print $2}'))"
+  ok "Host-Keys vorhanden ($(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | awk '{print $2}'))"
 fi
+
+if /usr/sbin/sshd -t 2>/tmp/sshd-test.log; then
+  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+  sleep 2
+  if systemctl is-active --quiet ssh || systemctl is-active --quiet sshd; then
+    ok "sshd laeuft"
+  else
+    warn "sshd laeuft nicht: systemctl status ssh"
+    SSH_BROKEN=true
+  fi
+else
+  warn "sshd-Konfiguration fehlerhaft:"
+  sed 's/^/      /' /tmp/sshd-test.log >&2
+  SSH_BROKEN=true
+fi
+rm -f /tmp/sshd-test.log
 
 # ---------------------------------------------------------------------------
 # 5 – k3s auf die neue IP umstellen
 # ---------------------------------------------------------------------------
 
-if systemctl list-unit-files k3s.service >/dev/null 2>&1; then
-  log "k3s auf ${CURRENT_IP} umstellen"
+k3s_diagnose() {
+  warn "Haeufige Ursachen, in dieser Reihenfolge pruefen:"
+  echo
+  echo "  Uhrzeit  - nach einem Snapshot-Restore laeuft die Uhr oft falsch."
+  echo "             k3s lehnt dann die eigenen Zertifikate ab."
+  timedatectl 2>/dev/null | sed 's/^/      /'
+  echo
+  echo "  Platte   - ist / voll, startet kein Pod mehr."
+  df -h / 2>/dev/null | sed 's/^/      /'
+  echo
+  echo "  Pakete   - ein abgebrochenes apt-Upgrade blockiert dpkg."
+  echo "             sudo dpkg --configure -a"
+  echo
+  echo "  Dienst   - $(systemctl is-enabled k3s 2>/dev/null || echo unbekannt) / $(systemctl is-active k3s 2>/dev/null || echo inaktiv)"
+  echo
+  echo "  Letzte Meldungen:"
+  journalctl -u k3s -n 25 --no-pager 2>/dev/null | sed 's/^/      /'
+  echo
+}
 
-  systemctl is-active --quiet k3s || systemctl start k3s
-
-  wait_api() {
-    for _ in $(seq 1 60); do
-      "$KUBECTL" get --raw=/readyz >/dev/null 2>&1 && return 0
-      sleep 5
-    done
-    return 1
-  }
-  wait_api || die "k3s-API nicht erreichbar. journalctl -u k3s -n 200"
-
-  # Das dynamische Serverzertifikat behaelt alte IPs in den SANs. Verwerfen,
-  # dann baut k3s es beim Start mit der aktuellen IP neu auf.
-  "$KUBECTL" -n kube-system delete secret k3s-serving --ignore-not-found >/dev/null 2>&1 || true
-  rm -f /var/lib/rancher/k3s/server/tls/dynamic-cert.json
-
-  systemctl restart k3s
-  wait_api || die "k3s ist nach dem Neustart nicht zurueckgekommen. journalctl -u k3s -n 200"
-
-  for _ in $(seq 1 36); do
-    "$KUBECTL" get node --no-headers 2>/dev/null | grep -qw Ready && break
+wait_api() {
+  local tries=${1:-60}
+  for _ in $(seq 1 "$tries"); do
+    "$KUBECTL" get --raw=/readyz >/dev/null 2>&1 && return 0
     sleep 5
   done
+  return 1
+}
 
-  node_ip=$("$KUBECTL" get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
-  if [[ "$node_ip" != "$CURRENT_IP" ]]; then
-    warn "Node-InternalIP steht auf ${node_ip:-?}, erwartet ${CURRENT_IP}. Node-Objekt wird neu registriert."
-    node_name=$("$KUBECTL" get node -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo civitas-node)
-    "$KUBECTL" delete node "$node_name" >/dev/null 2>&1 || true
-    systemctl restart k3s
-    wait_api || die "k3s ist nicht zurueckgekommen."
-    for _ in $(seq 1 36); do
-      "$KUBECTL" get node --no-headers 2>/dev/null | grep -qw Ready && break
-      sleep 5
-    done
-    node_ip=$("$KUBECTL" get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
-  fi
-  [[ "$node_ip" == "$CURRENT_IP" ]] && ok "Node-InternalIP ${node_ip}" \
-    || warn "Node-InternalIP weiterhin ${node_ip:-?} - vor 30-deploy-civitas.sh klaeren."
+wait_ready() {
+  for _ in $(seq 1 60); do
+    "$KUBECTL" get node --no-headers 2>/dev/null | grep -qw Ready && return 0
+    sleep 5
+  done
+  return 1
+}
 
-  sans=$(openssl s_client -connect 127.0.0.1:6443 </dev/null 2>/dev/null \
-    | openssl x509 -noout -ext subjectAltName 2>/dev/null \
-    | grep -o 'IP Address:[0-9.]*' | cut -d: -f2 | tr '\n' ' ')
-  if grep -qw "$CURRENT_IP" <<<"$sans"; then
-    ok "Zertifikat enthaelt ${CURRENT_IP} (SANs: ${sans})"
+if $SKIP_K3S; then
+  warn "Cluster-Schritt uebersprungen (--skip-k3s)."
+elif ! systemctl list-unit-files k3s.service >/dev/null 2>&1; then
+  warn "k3s ist nicht installiert - Cluster-Schritt uebersprungen."
+else
+  log "k3s auf ${CURRENT_IP} umstellen"
+  echo "  Das dauert nach dem Klonen typischerweise 2-5 Minuten."
+
+  # 20-sysprep-template.sh stoppt k3s. Ohne aktivierten Dienst kaeme der
+  # Cluster nach dem Boot gar nicht hoch.
+  systemctl is-enabled --quiet k3s || { systemctl enable k3s >/dev/null 2>&1 && ok "k3s-Dienst aktiviert"; }
+  systemctl is-active --quiet k3s || systemctl start k3s
+
+  if ! wait_api 60; then
+    warn "k3s-API nach 5 Minuten nicht erreichbar."
+    k3s_diagnose
+    K3S_BROKEN=true
   else
-    warn "Zertifikat enthaelt ${CURRENT_IP} nicht (SANs: ${sans})"
+    # Das dynamische Serverzertifikat behaelt alte IPs in den SANs. Verwerfen,
+    # dann baut k3s es beim Start mit der aktuellen IP neu auf.
+    "$KUBECTL" -n kube-system delete secret k3s-serving --ignore-not-found >/dev/null 2>&1 || true
+    rm -f /var/lib/rancher/k3s/server/tls/dynamic-cert.json
+
+    systemctl restart k3s
+    if ! wait_api 60; then
+      warn "k3s ist nach dem Neustart nicht zurueckgekommen."
+      k3s_diagnose
+      K3S_BROKEN=true
+    else
+      wait_ready || warn "Node meldet nach 5 Minuten kein Ready - kubectl describe node"
+
+      node_ip=$("$KUBECTL" get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
+      if [[ "$node_ip" != "$CURRENT_IP" ]]; then
+        warn "Node-InternalIP steht auf ${node_ip:-?}, erwartet ${CURRENT_IP}. Node-Objekt wird neu registriert."
+        node_name=$("$KUBECTL" get node -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo civitas-node)
+        "$KUBECTL" delete node "$node_name" >/dev/null 2>&1 || true
+        systemctl restart k3s
+        wait_api 60 && wait_ready || true
+        node_ip=$("$KUBECTL" get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
+      fi
+
+      if [[ "$node_ip" == "$CURRENT_IP" ]]; then
+        ok "Node-InternalIP ${node_ip}"
+      else
+        warn "Node-InternalIP weiterhin ${node_ip:-?} - vor 30-deploy-civitas.sh klaeren."
+        K3S_BROKEN=true
+      fi
+
+      sans=$(openssl s_client -connect 127.0.0.1:6443 </dev/null 2>/dev/null \
+        | openssl x509 -noout -ext subjectAltName 2>/dev/null \
+        | grep -o 'IP Address:[0-9.]*' | cut -d: -f2 | tr '\n' ' ')
+      if grep -qw "$CURRENT_IP" <<<"$sans"; then
+        ok "Zertifikat enthaelt ${CURRENT_IP} (SANs: ${sans})"
+      else
+        warn "Zertifikat enthaelt ${CURRENT_IP} nicht (SANs: ${sans})"
+      fi
+    fi
   fi
 
   # kubeconfig fuer den aufrufenden Benutzer auffrischen
   admin="${SUDO_USER:-}"
-  if [[ -n "$admin" && "$admin" != "root" ]]; then
+  if [[ -n "$admin" && "$admin" != "root" && -r /etc/rancher/k3s/k3s.yaml ]]; then
     home=$(getent passwd "$admin" | cut -d: -f6)
     if [[ -n "$home" ]]; then
       install -d -o "$admin" -g "$admin" -m 0700 "${home}/.kube"
@@ -291,8 +363,6 @@ if systemctl list-unit-files k3s.service >/dev/null 2>&1; then
       ok "kubeconfig fuer ${admin} aktualisiert"
     fi
   fi
-else
-  warn "k3s ist nicht installiert - Cluster-Schritt uebersprungen."
 fi
 
 # ---------------------------------------------------------------------------
@@ -301,9 +371,21 @@ fi
 
 show_state
 
-cat <<EOF
+echo
+echo "------------------------------------------------------------------"
 
-------------------------------------------------------------------
+if $SSH_BROKEN || $K3S_BROKEN; then
+  warn "Netzwerk und Hostname sind gesetzt und bleiben nach einem Neustart erhalten."
+  $SSH_BROKEN && echo "  Offen: sshd. Pruefen mit: sudo systemctl status ssh"
+  $K3S_BROKEN && echo "  Offen: k3s.  Pruefen mit: sudo journalctl -u k3s -n 200 --no-pager"
+  echo
+  echo "  Nach der Behebung dieses Skript einfach erneut aufrufen - es ist"
+  echo "  idempotent und wiederholt nur, was noch fehlt."
+  echo "------------------------------------------------------------------"
+  exit 1
+fi
+
+cat <<EOF
 Node ist personalisiert.
 
 Gegenprobe zum Master oder anderen Klonen - diese Werte MUESSEN abweichen:
@@ -315,7 +397,7 @@ Gleich sein DUERFEN und SOLLEN:
 Weiter mit:
   sudo cp /etc/civitas/deploy.env.example /etc/civitas/deploy.env
   sudo nano /etc/civitas/deploy.env
-  sudo ./30-deploy-civitas.sh
+  sudo bash 30-deploy-civitas.sh
 
 DNS-A-Records auf ${CURRENT_IP} zeigen lassen: api, idm, portal, dashboard
 ------------------------------------------------------------------

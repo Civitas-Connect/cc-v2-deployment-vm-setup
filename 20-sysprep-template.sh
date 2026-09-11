@@ -62,6 +62,16 @@ systemctl is-enabled civitas-firstboot.service >/dev/null 2>&1 \
 [[ -f /etc/netplan/01-civitas-dhcp.yaml ]] \
   || warn "Kein DHCP-Fallback unter /etc/netplan/01-civitas-dhcp.yaml. Klone kommen dann nur ueber die Konsole ans Netz."
 
+# Nach einem Snapshot-Restore laeuft die Uhr einer VM haeufig falsch. k3s
+# lehnt dann seine eigenen Zertifikate ab. Besser jetzt auffallen als im Klon.
+if ! timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
+  warn "Systemzeit ist nicht synchronisiert. Klone koennen dadurch k3s-Zertifikatsfehler bekommen."
+  warn "Vorher pruefen: timedatectl && systemctl restart systemd-timesyncd"
+fi
+
+avail=$(df --output=avail -BG / 2>/dev/null | tail -1 | tr -dc '0-9')
+[[ -n "$avail" && "$avail" -lt 10 ]] && warn "Nur ${avail}G frei auf / - Klone laufen damit schnell voll."
+
 found_key=false
 for home in /root /home/*; do
   [[ -s "${home}/.ssh/authorized_keys" ]] && found_key=true
@@ -102,6 +112,9 @@ echo "  civitas-firstboot loescht sie im Klon nicht, sie sind aber auch nicht ak
 # ---------------------------------------------------------------------------
 
 log "k3s stoppen"
+# Der Dienst muss aktiviert BLEIBEN, sonst kommt der Cluster nach dem Boot
+# des Klons gar nicht hoch und 25-postclone-setup.sh wartet ins Leere.
+systemctl enable k3s >/dev/null 2>&1 || true
 systemctl stop k3s 2>/dev/null || true
 [[ -x /usr/local/bin/k3s-killall.sh ]] && /usr/local/bin/k3s-killall.sh >/dev/null 2>&1 || true
 sleep 3

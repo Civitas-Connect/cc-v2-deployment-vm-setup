@@ -108,7 +108,16 @@ fi
 # ---------------------------------------------------------------------------
 
 if ! $ADDONS_ONLY; then
-  log "Grundsystem und Basis-Pakete"
+  # apt-get upgrade laeuft je nach Update-Rueckstand viele Minuten ohne Ausgabe.
+# Reisst dabei die SSH-Sitzung ab, bleibt dpkg auf halbem Weg stehen.
+if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
+  warn "Der Lauf haengt an dieser SSH-Sitzung. Reisst sie ab, bleibt dpkg auf halbem Weg stehen."
+  warn "Empfehlung: abbrechen und in 'tmux' oder 'screen' erneut starten."
+  read -r -p "Trotzdem fortfahren? [ja/NEIN] " a
+  [[ "$a" == "ja" ]] || die "Abgebrochen."
+fi
+
+log "Grundsystem und Basis-Pakete"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get upgrade -y -qq
@@ -320,6 +329,20 @@ if command -v cloud-init >/dev/null 2>&1; then
   cloud-init clean --logs >/dev/null 2>&1 || true
 fi
 rm -rf /var/lib/cloud/instances/* /var/lib/cloud/data/* 2>/dev/null || true
+
+# Ohne DHCP im Segment steht der Klon nach dem Boot ohne Adresse da. Damit
+# derjenige an der Hypervisor-Konsole nicht suchen muss, steht der noetige
+# Befehl direkt ueber dem Login-Prompt.
+cat >/etc/issue <<'ISSUE'
+
+  CIVITAS-Klon, noch nicht personalisiert.
+
+  Netzwerk und Hostname setzen:
+    sudo bash /opt/civitas/scripts/25-postclone-setup.sh          --hostname <name> --ip <adresse>/24 --gateway <gw> --dns <resolver>
+
+  Alles in EINER Zeile eingeben.
+
+ISSUE
 
 rm -f "$SEAL"
 say "fertig, Neustart"
