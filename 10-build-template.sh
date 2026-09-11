@@ -521,20 +521,98 @@ if ! $ADDONS_ONLY; then
 
   log "Vorlage fuer die Deployment-Konfiguration"
   mkdir -p /etc/civitas
-  cat >/etc/civitas/deploy.env.example <<'EOF'
-# Von 30-deploy-civitas.sh gelesen. Kopie nach /etc/civitas/deploy.env anlegen.
-# ACHTUNG: /etc/civitas/deploy.env enthaelt Zugangsdaten und wird vom Sysprep geloescht.
+  cat >/etc/civitas/deploy.env.example <<'CIVITASENV'
+# =============================================================================
+# deploy.env.example  –  Konfiguration einer CIVITAS/CORE-V2-Instanz
+# =============================================================================
+#
+# Wird von 30-deploy-civitas.sh gelesen. Auf dem Klon kopieren und ausfuellen:
+#
+#   sudo cp /etc/civitas/deploy.env.example /etc/civitas/deploy.env
+#   sudo nano /etc/civitas/deploy.env
+#   sudo chmod 600 /etc/civitas/deploy.env
+#
+# Voraussetzung: der Node ist bereits personalisiert
+# (sudo bash 25-postclone-setup.sh --hostname ... --ip ...).
+#
+# ACHTUNG: /etc/civitas/deploy.env enthaelt Zugangsdaten. Die Datei wird von
+# 20-sysprep-template.sh geloescht und gehoert nicht ins Image und nicht ins
+# Git-Repo.
+#
+# Syntax: KEY=wert, eine Zuweisung pro Zeile, keine Leerzeichen um das =.
+# Werte mit Sonderzeichen in doppelte Anfuehrungszeichen setzen.
+# =============================================================================
 
+
+# -----------------------------------------------------------------------------
+# Pflicht
+# -----------------------------------------------------------------------------
+
+# Basis-Domain der Instanz. Darunter muessen mindestens diese A-Records auf die
+# Node-IP zeigen:  api, idm, portal, dashboard
+# 30-deploy-civitas.sh prueft das vorab per getent und warnt bei Abweichungen.
 DOMAIN=demo.civitascore.de
+
+# Kurzname der Instanz. Wird gleichzeitig als Kubernetes-Namespace und als
+# Keycloak-Realm verwendet. Nur Kleinbuchstaben, Ziffern und Bindestriche.
+# Muss sich zwischen Instanzen unterscheiden, sonst kollidieren die Realms.
 INSTANCE_SLUG=demo
+
+# Erster Benutzer im Keycloak-Realm. Bekommt die Einladungsmail und damit die
+# Administrationsrechte im Portal. Ohne funktionierendes SMTP kommt diese Mail
+# nicht an - dann das Passwort spaeter ueber die Keycloak-Konsole setzen.
 INITIAL_USER_EMAIL=admin@example.org
+
+# Kontaktadresse fuer Let's Encrypt. Geht an den ACME-Account, nicht an Nutzer.
+# Hierhin laufen Ablaufwarnungen, wenn ein Zertifikat nicht erneuert wird.
 LETSENCRYPT_EMAIL=technik@example.org
 
-# true = Let's-Encrypt-Staging (kein Rate Limit, Browser meckert). Zum Testen sinnvoll.
-LETSENCRYPT_STAGING=false
 
-# Node-IP; leer = automatisch ermitteln
+# -----------------------------------------------------------------------------
+# Zertifikate
+# -----------------------------------------------------------------------------
+
+# true  = Let's-Encrypt-Staging. Kein Rate Limit, aber der Browser meckert.
+#         Fuer jeden ersten Durchlauf auf einer neuen Domain empfohlen.
+# false = Produktion. Achtung: 5 fehlgeschlagene Validierungen pro Konto und
+#         Stunde, danach ist die Domain fuer eine Stunde gesperrt.
+#
+# Der ClusterIssuer heisst in beiden Faellen letsencrypt-prod, weil die
+# CIVITAS-Ingresses ihn so referenzieren. Nur der ACME-Endpunkt wechselt.
+# Nach dem Wechsel von staging auf prod die Secrets der Zertifikate loeschen:
+#   kubectl -n <slug> delete secret -l cert-manager.io/certificate-name
+LETSENCRYPT_STAGING=true
+
+
+# -----------------------------------------------------------------------------
+# Netzwerk
+# -----------------------------------------------------------------------------
+
+# Node-IP fuer den CoreDNS-Split-Horizon. Leer lassen = wird aus dem
+# Kubernetes-Node-Objekt ermittelt, ersatzweise aus der Default-Route.
+#
+# Nur setzen, wenn die automatische Ermittlung die falsche Adresse liefert,
+# etwa bei mehreren Interfaces. Weicht der Wert von der tatsaechlichen Adresse
+# ab, bricht 30-deploy-civitas.sh mit einem Hinweis auf 25-postclone-setup.sh ab.
 NODE_IP=
+
+# Zusaetzliche Hostnamen fuer den Split-Horizon, ohne Domain-Suffix, durch
+# Leerzeichen getrennt. Die vier Kern-Hosts (api, idm, portal, dashboard) sind
+# immer dabei und muessen hier nicht stehen.
+# Beispiel fuer eine Instanz mit eigenem NiFi- und MinIO-Ingress:
+#   EXTRA_HOSTS="nifi s3"
+EXTRA_HOSTS=""
+
+
+# -----------------------------------------------------------------------------
+# SMTP  (Keycloak: Einladungen, Passwort-Reset, Verifikationsmails)
+# -----------------------------------------------------------------------------
+#
+# Landet im Secret keycloak-smtp im Namespace der Instanz. Bleibt SMTP_HOST
+# leer, laeuft das Deployment durch, aber Keycloak kann keine Mails versenden -
+# der initiale Benutzer bekommt dann keine Einladung.
+#
+# Auf Port 587 erwartet Keycloak STARTTLS, auf 465 implizites SSL.
 
 SMTP_HOST=smtp.example.org
 SMTP_PORT=587
@@ -542,10 +620,15 @@ SMTP_FROM=noreply@example.org
 SMTP_USER=
 SMTP_PASSWORD=
 
-# Zusaetzliche Hostnamen fuer den CoreDNS-Split-Horizon (Leerzeichen-getrennt,
-# ohne Domain-Suffix). Standard deckt die vier Kern-Hosts ab.
-EXTRA_HOSTS=""
-EOF
+
+# -----------------------------------------------------------------------------
+# Optional
+# -----------------------------------------------------------------------------
+
+# Pfad zum ausgecheckten civitas-core-deployment-Repo. Nur aendern, wenn im
+# Template ein abweichender Ort verwendet wurde.
+#CIVITAS_DIR=/opt/civitas/civitas-core-deployment
+CIVITASENV
   chmod 0644 /etc/civitas/deploy.env.example
 
   if [[ "$PREPULL_IMAGES" == "true" ]]; then
