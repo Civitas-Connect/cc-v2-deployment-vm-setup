@@ -273,6 +273,17 @@ EOF
   chmod 0600 /etc/netplan/01-civitas-dhcp.yaml
   netplan generate || warn "netplan generate meldet Fehler - 01-civitas-dhcp.yaml pruefen."
 
+  log "Zeitsynchronisation sicherstellen"
+  # Ohne verlaessliche Uhr erzeugt k3s im Klon Zertifikate mit einem NotBefore
+  # in der Zukunft. Zieht NTP die Uhr spaeter zurueck, ist der Cluster tot.
+  systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+  timedatectl set-ntp true >/dev/null 2>&1 || true
+  if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
+    echo "  Uhr synchronisiert: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+  else
+    warn "Uhr ist nicht synchronisiert. Vor dem Versiegeln klaeren, sonst erben alle Klone das Problem."
+  fi
+
   log "cloud-init-Netzwerkkonfiguration abschalten"
   mkdir -p /etc/cloud/cloud.cfg.d
   echo 'network: {config: disabled}' >/etc/cloud/cloud.cfg.d/99-civitas-disable-network.cfg

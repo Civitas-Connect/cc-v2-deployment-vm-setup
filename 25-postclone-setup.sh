@@ -263,6 +263,8 @@ k3s_diagnose() {
   echo "  Uhrzeit  - nach einem Snapshot-Restore laeuft die Uhr oft falsch."
   echo "             k3s lehnt dann die eigenen Zertifikate ab."
   timedatectl 2>/dev/null | sed 's/^/      /'
+  echo "      Zertifikat gueltig ab: $(openssl x509 -in /var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt -noout -startdate 2>/dev/null | cut -d= -f2)"
+  echo "      Reparatur bei Zukunftsdatum: sudo k3s certificate rotate"
   echo
   echo "  Platte   - ist / voll, startet kein Pod mehr."
   df -h / 2>/dev/null | sed 's/^/      /'
@@ -294,11 +296,71 @@ wait_ready() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# 5a – Systemzeit
+#
+# Der kritischste Schritt vor allem, was mit k3s zu tun hat. Ein Klon startet
+# haeufig mit falsch gehender Uhr (Snapshot-Restore, RTC der VM). Erzeugt k3s
+# in diesem Zustand Zertifikate, bekommen sie ein NotBefore in der Zukunft -
+# und sobald NTP die Uhr zurueckzieht, ist der Cluster tot mit
+# "certificate has expired or is not yet valid".
+# ---------------------------------------------------------------------------
+
+sync_time() {
+  log "Systemzeit pruefen"
+  timedatectl set-ntp true >/dev/null 2>&1 || true
+  systemctl restart systemd-timesyncd >/dev/null 2>&1 || true
+
+  for _ in $(seq 1 24); do
+    [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]] && break
+    sleep 5
+  done
+
+  if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
+    ok "Uhr synchronisiert: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    return 0
+  fi
+  warn "Uhr ist nach 2 Minuten nicht synchronisiert ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))."
+  warn "Ohne korrekte Zeit erzeugt k3s unbrauchbare Zertifikate. Zeitquelle pruefen:"
+  warn "  timedatectl && systemctl status systemd-timesyncd"
+  return 1
+}
+
+# Liegt das NotBefore eines k3s-Zertifikats in der Zukunft, wurde es bei
+# falscher Uhr erzeugt. Nur ein Rotieren hilft, ein Neustart nicht.
+certs_from_the_future() {
+  local crt=/var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt
+  [[ -f "$crt" ]] || return 1
+  local nb
+  nb=$(openssl x509 -in "$crt" -noout -startdate 2>/dev/null | cut -d= -f2) || return 1
+  [[ -n "$nb" ]] || return 1
+  (( $(date -d "$nb" +%s 2>/dev/null || echo 0) > $(date +%s) ))
+}
+
+rotate_certs() {
+  log "k3s-Zertifikate neu ausstellen"
+  systemctl stop k3s 2>/dev/null || true
+  [[ -x /usr/local/bin/k3s-killall.sh ]] && /usr/local/bin/k3s-killall.sh >/dev/null 2>&1 || true
+  sleep 3
+  rm -f /var/lib/rancher/k3s/server/tls/dynamic-cert.json
+  rm -f /var/lib/rancher/k3s/agent/client-*.crt /var/lib/rancher/k3s/agent/client-*.key
+  k3s certificate rotate >/dev/null 2>&1 || warn "k3s certificate rotate meldete einen Fehler."
+  systemctl start k3s
+  ok "rotiert"
+}
+
 if $SKIP_K3S; then
   warn "Cluster-Schritt uebersprungen (--skip-k3s)."
 elif ! systemctl list-unit-files k3s.service >/dev/null 2>&1; then
   warn "k3s ist nicht installiert - Cluster-Schritt uebersprungen."
 else
+  sync_time || K3S_BROKEN=true
+
+  if certs_from_the_future; then
+    warn "k3s-Zertifikate wurden bei falsch gehender Uhr erzeugt und sind noch nicht gueltig."
+    rotate_certs
+  fi
+
   log "k3s auf ${CURRENT_IP} umstellen"
   echo "  Das dauert nach dem Klonen typischerweise 2-5 Minuten."
 
@@ -319,6 +381,14 @@ else
 
     systemctl restart k3s
     if ! wait_api 60; then
+      # Haeufigster Grund an dieser Stelle: das eben neu ausgestellte
+      # Serverzertifikat traegt wieder ein NotBefore aus der Zukunft.
+      if certs_from_the_future; then
+        rotate_certs
+        wait_api 60 || true
+      fi
+    fi
+    if ! "$KUBECTL" get --raw=/readyz >/dev/null 2>&1; then
       warn "k3s ist nach dem Neustart nicht zurueckgekommen."
       k3s_diagnose
       K3S_BROKEN=true

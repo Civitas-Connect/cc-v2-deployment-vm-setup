@@ -190,6 +190,17 @@ echo "  /etc/civitas/sealed gesetzt - civitas-firstboot greift beim naechsten Bo
 # 6 – Speicher zurueckgeben und Puffer auf die Platte zwingen
 # ---------------------------------------------------------------------------
 
+# Ein Zertifikat mit Zukunftsdatum wandert sonst ins Image und macht jeden
+# Klon unbrauchbar, sobald NTP die Uhr korrigiert.
+crt=/var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt
+if [[ -f "$crt" ]]; then
+  nb=$(openssl x509 -in "$crt" -noout -startdate 2>/dev/null | cut -d= -f2)
+  if [[ -n "$nb" ]] && (( $(date -d "$nb" +%s 2>/dev/null || echo 0) > $(date +%s) )); then
+    warn "k3s-Zertifikat ist erst ab ${nb} gueltig - es wurde bei falscher Uhr erzeugt."
+    warn "Vor dem Snapshot beheben: timedatectl set-ntp true && sudo k3s certificate rotate"
+  fi
+fi
+
 log "fstrim"
 fstrim -av 2>/dev/null || warn "fstrim nicht moeglich (kein TRIM-faehiges Volume)."
 

@@ -152,10 +152,13 @@ eintragen, dann ist das Image bit-genau wiederholbar.
 * **Teilfehler brechen nicht mehr alles ab.** Scheitert der SSH- oder k3s-Schritt,
   bleiben Netzwerk und Hostname trotzdem gesetzt; das Skript meldet, was offen ist,
   und kann nach der Behebung einfach erneut laufen.
-* **Systemzeit.** Nach einem Snapshot-Restore geht die Uhr oft falsch, und k3s lehnt
-  dann seine eigenen Zertifikate ab — sichtbar als API, die nie `readyz` meldet.
-  `20-sysprep-template.sh` warnt vorab, `25-postclone-setup.sh` zeigt es in der
-  Diagnose an.
+* **Systemzeit — der häufigste Killer beim Klonen.** Startet ein Klon mit falsch
+  gehender Uhr und erzeugt k3s in diesem Zustand Zertifikate, tragen sie ein
+  `NotBefore` in der Zukunft. Sobald NTP die Uhr zurückzieht, ist der Cluster tot mit
+  `certificate has expired or is not yet valid`, und ein Neustart hilft nicht.
+  `25-postclone-setup.sh` wartet deshalb auf die NTP-Synchronisation, bevor es k3s
+  anfasst, erkennt Zertifikate mit Zukunftsdatum und rotiert sie automatisch.
+  Von Hand: `sudo k3s certificate rotate` nach `timedatectl set-ntp true`.
 * **`10-build-template.sh` nicht über eine nackte SSH-Sitzung laufen lassen.**
   `apt-get upgrade` arbeitet minutenlang ohne Ausgabe; reißt die Verbindung ab,
   bleibt dpkg auf halbem Weg stehen. Das Skript warnt und empfiehlt `tmux`.
