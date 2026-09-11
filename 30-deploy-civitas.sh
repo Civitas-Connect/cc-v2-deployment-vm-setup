@@ -25,15 +25,6 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Bitte mit sudo ausfuehren."
 
-# In ein stabiles Verzeichnis wechseln, das dieses Skript garantiert nicht anfasst.
-# Wurde das Skript aus /opt/civitas/rendered/... heraus aufgerufen (z.B. weil man
-# vorher zum Debuggen dorthin gecd't hat), reisst der spaetere rm -rf/cp -a des
-# Repo-Copys (Schritt 7) genau dieses Arbeitsverzeichnis unter dem laufenden Prozess
-# weg. Jeder folgende getcwd()-Aufruf - auch in helmfile selbst - schlaegt dann mit
-# "no such file or directory" fehl, obwohl unter demselben Pfad laengst wieder ein
-# frisches Verzeichnis existiert (neue Inode, alte cwd-Bindung ist aber tot).
-cd /opt/civitas || die "cd /opt/civitas fehlgeschlagen"
-
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 KUBECTL=/usr/local/bin/kubectl
 
@@ -72,17 +63,15 @@ EXTRA_HOSTS="${EXTRA_HOSTS:-}"
 NS="$INSTANCE_SLUG"
 CIVITAS_DIR="${CIVITAS_DIR:-/opt/civitas/civitas-core-deployment}"
 WORK_DIR="/opt/civitas/rendered"
-# Das gesamte Repo wird kopiert, nicht nur defaults/deployment: helmfile-root.yaml.gotmpl
-# liegt im Repo-Root, und defaults/deployment/*.yaml(.gotmpl) referenzieren es ueber
-# '../helmfile-root.yaml.gotmpl' - das funktioniert nur, wenn das Deployment-Verzeichnis
-# EINE Ebene direkt unter dem Repo-Root liegt, nicht zwei (wie defaults/deployment es tut).
-# Genau deshalb kopiert auch das offizielle justfile (Target "deploy") vor jedem Lauf
-# "defaults/deployment" nach "deployment" im Repo-Root - das bilden wir unten nach.
+# Das gesamte Repo wird kopiert, nicht nur defaults/deployment: die
+# helmfile.yaml dort verweist per '../helmfile-root.yaml.gotmpl' auf eine
+# Ebene oberhalb. Wird nur das Unterverzeichnis kopiert, zeigt der Pfad ins
+# Leere, helmfile findet keine Releases und beendet sich lautlos ohne Rollout.
 REPO_COPY="${WORK_DIR}/repo"
-DEPLOY_DIR="${REPO_COPY}/deployment"
+DEPLOY_DIR="${REPO_COPY}/defaults/deployment"
 # Zwei Einstiegspunkte, in dieser Reihenfolge. helmfile.yaml im selben
 # Verzeichnis ist NICHT der richtige Einstieg - sie verweist auf eine
-# helmfile-root.yaml.gotmpl, die (nur) im Repo-Root liegt.
+# helmfile-root.yaml.gotmpl, die es in diesem Repo-Layout nicht gibt.
 HELMFILE_OPERATORS="${DEPLOY_DIR}/helmfile-operators.yaml"
 HELMFILE_INSTANCE="${DEPLOY_DIR}/helmfile-instance.yaml.gotmpl"
 OPERATOR_NS="${OPERATOR_NS:-civitas-operators}"
@@ -303,14 +292,6 @@ log "Deployment-Verzeichnis unter ${WORK_DIR} aufbauen"
 mkdir -p "$WORK_DIR"
 rm -rf "$REPO_COPY"
 cp -a "$CIVITAS_DIR" "$REPO_COPY"
-
-# Wie im offiziellen justfile (Target "deploy"): defaults/deployment nach deployment/
-# im Repo-Root kopieren, damit '../helmfile-root.yaml.gotmpl' aus den Helmfiles dort
-# auf das tatsaechlich vorhandene helmfile-root.yaml.gotmpl im Repo-Root zeigt.
-[[ -d "${REPO_COPY}/defaults/deployment" ]] \
-  || die "${REPO_COPY}/defaults/deployment fehlt - die Repo-Struktur weicht von der erwarteten ab."
-rm -rf "$DEPLOY_DIR"
-cp -a "${REPO_COPY}/defaults/deployment" "$DEPLOY_DIR"
 
 for f in "$HELMFILE_OPERATORS" "$HELMFILE_INSTANCE"; do
   [[ -f "$f" ]] || die "${f} fehlt - die Repo-Struktur weicht von der erwarteten ab.
