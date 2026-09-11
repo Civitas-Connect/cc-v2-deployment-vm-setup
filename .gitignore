@@ -1,2 +1,7 @@
-./idea
+./idea/
 
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/.gitignore
+/.idea/files_v2_demo_clone.iml
+/.idea/modules.xml
+/.idea/vcs.xml
