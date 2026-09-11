@@ -8,6 +8,9 @@
 #   - ingress-nginx (DaemonSet + hostNetwork) und cert-manager
 #   - Tooling (helm, helmfile, helm-diff, k9s, jq, git)
 #   - civitas-core-deployment-Repo auf festem Tag + optionales Vorziehen aller Images
+#   - civitas-firstboot.service: erzeugt in jedem Klon beim ersten Boot eine
+#     frische Maschinenidentitaet (machine-id, SSH-Host-Keys, k3s-Serverzertifikat)
+#   - DHCP-Fallback im Netz, damit ein Klon ohne Konsolenzugriff online kommt
 #
 # Es wird bewusst KEIN ClusterIssuer, KEIN Namespace und KEIN CIVITAS-Deployment angelegt.
 # Alles Domain- und IP-abhängige passiert erst in 30-deploy-civitas.sh nach dem Klonen.
@@ -223,6 +226,131 @@ findtime  = 1d
 maxretry  = 3
 EOF
   systemctl enable --now fail2ban
+fi
+
+# ---------------------------------------------------------------------------
+# 2b – Klon-Automatik
+#
+# Das Image traegt alles, was ein Klon zum Selbststart braucht:
+#   - DHCP-Fallback, damit jeder Klon ohne Konsole online kommt
+#   - cloud-init schreibt keine Netzwerkkonfiguration mehr (Nutanix AHV liefert
+#     je nach Vorlage eine aus, die sonst mit 25-postclone-setup.sh kollidiert)
+#   - civitas-firstboot.service erzeugt beim ersten Boot eines versiegelten
+#     Images eine frische Maschinenidentitaet und startet danach neu
+#
+# Dadurch muss 20-sysprep-template.sh die Identitaet NICHT mehr loeschen -
+# und genau deshalb darf der Master weiterlaufen und live gesnapshottet werden.
+# ---------------------------------------------------------------------------
+
+if ! $ADDONS_ONLY; then
+  log "Netz-Fallback fuer Klone (DHCP)"
+  # Niedrige Nummer = verliert gegen die Instanzkonfiguration aus
+  # 25-postclone-setup.sh (10-civitas-instance.yaml) und gegen cloud-init (50-).
+  # Auf der Build-VM aendert sich dadurch nichts, es wird kein netplan apply
+  # ausgefuehrt.
+  cat >/etc/netplan/01-civitas-dhcp.yaml <<'EOF'
+# Fallback aus dem CIVITAS-Template. Greift nur, wenn keine Instanz-
+# konfiguration vorhanden ist - also unmittelbar nach dem Klonen.
+network:
+  version: 2
+  ethernets:
+    civitas-fallback:
+      match:
+        name: "e*"
+      dhcp4: true
+      dhcp6: false
+      optional: true
+EOF
+  chmod 0600 /etc/netplan/01-civitas-dhcp.yaml
+  netplan generate || warn "netplan generate meldet Fehler - 01-civitas-dhcp.yaml pruefen."
+
+  log "cloud-init-Netzwerkkonfiguration abschalten"
+  mkdir -p /etc/cloud/cloud.cfg.d
+  echo 'network: {config: disabled}' >/etc/cloud/cloud.cfg.d/99-civitas-disable-network.cfg
+
+  log "civitas-firstboot installieren"
+  mkdir -p /etc/civitas
+  cat >/usr/local/sbin/civitas-firstboot.sh <<'EOF'
+#!/usr/bin/env bash
+#
+# Laeuft sehr frueh im Boot, bevor sshd und k3s starten, und nur dann, wenn
+# /etc/civitas/sealed existiert - also beim ersten Boot eines frisch
+# geklonten (oder frisch versiegelten) Images.
+#
+# Aufgabe: alles loeschen, was pro Maschine einzigartig sein muss. Der
+# anschliessende Neustart laesst systemd, sshd und k3s die Werte sauber neu
+# erzeugen. Ein fruehes Loeschen im laufenden Betrieb (klassischer Sysprep)
+# waere hier nicht moeglich, weil der Master fuer den Snapshot laufen muss.
+#
+set -uo pipefail
+
+SEAL=/etc/civitas/sealed
+[[ -e "$SEAL" ]] || exit 0
+
+say() { echo "civitas-firstboot: $*" >&2; }
+say "versiegeltes Image erkannt, Maschinenidentitaet wird neu erzeugt"
+
+# --- SSH-Host-Keys ---------------------------------------------------------
+rm -f /etc/ssh/ssh_host_*
+
+# --- machine-id ------------------------------------------------------------
+# Leere Datei: systemd erzeugt beim naechsten Boot eine neue ID.
+: >/etc/machine-id
+rm -f /var/lib/dbus/machine-id
+ln -sf /etc/machine-id /var/lib/dbus/machine-id
+
+# --- Netz und Hostname -----------------------------------------------------
+# Die Instanzkonfiguration des Masters darf nicht mit in den Klon, sonst gibt
+# es einen IP-Konflikt. Der DHCP-Fallback (01-) bleibt liegen.
+rm -f /etc/netplan/10-civitas-instance.yaml /etc/netplan/50-cloud-init.yaml
+echo civitas-unconfigured >/etc/hostname
+if [[ -w /etc/hosts ]]; then
+  sed -i '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts
+  printf '127.0.1.1\tcivitas-unconfigured\n' >>/etc/hosts
+fi
+
+# --- k3s -------------------------------------------------------------------
+# Das dynamische Serverzertifikat traegt die alte Node-IP in den SANs.
+# Nach dem Loeschen baut k3s es beim Start neu auf.
+rm -f /var/lib/rancher/k3s/server/tls/dynamic-cert.json
+rm -rf /var/log/pods/* /var/log/containers/*
+
+# --- cloud-init ------------------------------------------------------------
+if command -v cloud-init >/dev/null 2>&1; then
+  cloud-init clean --logs >/dev/null 2>&1 || true
+fi
+rm -rf /var/lib/cloud/instances/* /var/lib/cloud/data/* 2>/dev/null || true
+
+rm -f "$SEAL"
+say "fertig, Neustart"
+systemctl reboot
+EOF
+  chmod 0755 /usr/local/sbin/civitas-firstboot.sh
+
+  cat >/etc/systemd/system/civitas-firstboot.service <<'EOF'
+[Unit]
+Description=CIVITAS: Erstboot nach dem Klonen (Maschinenidentitaet neu erzeugen)
+Documentation=file:///usr/local/sbin/civitas-firstboot.sh
+ConditionPathExists=/etc/civitas/sealed
+# Bewusst sehr frueh: vor sshd (alte Host-Keys) und vor k3s (alte Node-IP).
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/civitas-firstboot.sh
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=sysinit.target
+EOF
+  systemctl daemon-reload
+  systemctl enable civitas-firstboot.service >/dev/null
+  echo "  civitas-firstboot.service aktiviert (greift nur bei /etc/civitas/sealed)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -498,9 +626,15 @@ Naechste Schritte:
        kubectl get pods -A
        curl -I http://127.0.0.1        # 404 von nginx = Ingress erreichbar
   2. SSH-Key fuer ${ADMIN_USER} hinterlegen, falls noch nicht geschehen.
-  3. sudo ./20-sysprep-template.sh    # danach VM herunterfahren und Snapshot/Template ziehen
+  3. sudo ./20-sysprep-template.sh    # versiegelt das Image; die VM LAEUFT weiter
+  4. Im Hypervisor einen Snapshot der laufenden VM ziehen.
 
 Bewusst NICHT im Image: ClusterIssuer, Namespace, Secrets, CIVITAS-Release.
 Die kommen pro Klon aus 30-deploy-civitas.sh.
+
+Der Klon fuehrt beim ersten Boot civitas-firstboot.service aus, erzeugt eine
+neue machine-id samt SSH-Host-Keys und startet einmal selbstaendig neu. Danach:
+  sudo ./25-postclone-setup.sh --hostname ... --ip ... --gateway ... --dns ...
+  sudo ./30-deploy-civitas.sh
 ------------------------------------------------------------------
 EOF

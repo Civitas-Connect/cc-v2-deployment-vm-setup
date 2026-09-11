@@ -10,6 +10,7 @@
 #   - CoreDNS-Eintraege aus den tatsaechlichen Ingresses nachziehen
 #
 # Voraussetzung: /etc/civitas/deploy.env (Vorlage: /etc/civitas/deploy.env.example)
+#                Node ist personalisiert (./25-postclone-setup.sh gelaufen)
 #
 # Aufruf:
 #   sudo ./30-deploy-civitas.sh              # voller Rollout
@@ -40,6 +41,11 @@ esac
 # 1 – Konfiguration laden und pruefen
 # ---------------------------------------------------------------------------
 
+# Versiegeltes Image: civitas-firstboot hat noch nicht gelaufen. Ein Deployment
+# wuerde beim naechsten Boot komplett neu personalisiert und damit zerlegt.
+[[ -e /etc/civitas/sealed ]] \
+  && die "Diese VM ist noch versiegelt (/etc/civitas/sealed). Erst neu starten, dann ./25-postclone-setup.sh, dann dieses Skript."
+
 ENV_FILE=/etc/civitas/deploy.env
 [[ -f "$ENV_FILE" ]] || die "$ENV_FILE fehlt. Vorlage: cp /etc/civitas/deploy.env.example $ENV_FILE"
 set -a
@@ -64,6 +70,16 @@ if [[ -z "${NODE_IP:-}" ]]; then
   [[ -n "$NODE_IP" ]] || NODE_IP=$(ip -4 route get 1.1.1.1 | awk '{print $7; exit}')
 fi
 [[ -n "$NODE_IP" ]] || die "Node-IP konnte nicht ermittelt werden. NODE_IP in $ENV_FILE setzen."
+
+# Stimmt die Node-IP nicht mit der tatsaechlichen Adresse ueberein, hat k3s den
+# IP-Wechsel nach dem Klonen nicht mitbekommen. Der CoreDNS-Split-Horizon
+# weiter unten wuerde dann auf die alte Adresse zeigen.
+HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+if [[ -n "$HOST_IP" && "$HOST_IP" != "$NODE_IP" ]]; then
+  die "k3s meldet Node-IP ${NODE_IP}, die Maschine hat aber ${HOST_IP}.
+Erst korrigieren: sudo ./25-postclone-setup.sh --check
+Danach: sudo ./25-postclone-setup.sh --hostname \$(hostname) --ip ${HOST_IP}/<praefix> --gateway <gw> --dns <dns>"
+fi
 
 CORE_HOSTS=(api idm portal dashboard)
 for h in $EXTRA_HOSTS; do CORE_HOSTS+=("$h"); done
