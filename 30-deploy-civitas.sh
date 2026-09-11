@@ -25,6 +25,15 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Bitte mit sudo ausfuehren."
 
+# In ein stabiles Verzeichnis wechseln, das dieses Skript garantiert nicht anfasst.
+# Wurde das Skript aus /opt/civitas/rendered/... heraus aufgerufen (z.B. weil man
+# vorher zum Debuggen dorthin gecd't hat), reisst der spaetere rm -rf/cp -a des
+# Repo-Copys (Schritt 7) genau dieses Arbeitsverzeichnis unter dem laufenden Prozess
+# weg. Jeder folgende getcwd()-Aufruf - auch in helmfile selbst - schlaegt dann mit
+# "no such file or directory" fehl, obwohl unter demselben Pfad laengst wieder ein
+# frisches Verzeichnis existiert (neue Inode, alte cwd-Bindung ist aber tot).
+cd /opt/civitas || die "cd /opt/civitas fehlgeschlagen"
+
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 KUBECTL=/usr/local/bin/kubectl
 
@@ -63,15 +72,17 @@ EXTRA_HOSTS="${EXTRA_HOSTS:-}"
 NS="$INSTANCE_SLUG"
 CIVITAS_DIR="${CIVITAS_DIR:-/opt/civitas/civitas-core-deployment}"
 WORK_DIR="/opt/civitas/rendered"
-# Das gesamte Repo wird kopiert, nicht nur defaults/deployment: die
-# helmfile.yaml dort verweist per '../helmfile-root.yaml.gotmpl' auf eine
-# Ebene oberhalb. Wird nur das Unterverzeichnis kopiert, zeigt der Pfad ins
-# Leere, helmfile findet keine Releases und beendet sich lautlos ohne Rollout.
+# Das gesamte Repo wird kopiert, nicht nur defaults/deployment: helmfile-root.yaml.gotmpl
+# liegt im Repo-Root, und defaults/deployment/*.yaml(.gotmpl) referenzieren es ueber
+# '../helmfile-root.yaml.gotmpl' - das funktioniert nur, wenn das Deployment-Verzeichnis
+# EINE Ebene direkt unter dem Repo-Root liegt, nicht zwei (wie defaults/deployment es tut).
+# Genau deshalb kopiert auch das offizielle justfile (Target "deploy") vor jedem Lauf
+# "defaults/deployment" nach "deployment" im Repo-Root - das bilden wir unten nach.
 REPO_COPY="${WORK_DIR}/repo"
-DEPLOY_DIR="${REPO_COPY}/defaults/deployment"
+DEPLOY_DIR="${REPO_COPY}/deployment"
 # Zwei Einstiegspunkte, in dieser Reihenfolge. helmfile.yaml im selben
 # Verzeichnis ist NICHT der richtige Einstieg - sie verweist auf eine
-# helmfile-root.yaml.gotmpl, die es in diesem Repo-Layout nicht gibt.
+# helmfile-root.yaml.gotmpl, die (nur) im Repo-Root liegt.
 HELMFILE_OPERATORS="${DEPLOY_DIR}/helmfile-operators.yaml"
 HELMFILE_INSTANCE="${DEPLOY_DIR}/helmfile-instance.yaml.gotmpl"
 OPERATOR_NS="${OPERATOR_NS:-civitas-operators}"
@@ -106,6 +117,28 @@ printf '  Repo-Tag        : %s\n' "$(git -C "$CIVITAS_DIR" describe --tags --alw
 # ---------------------------------------------------------------------------
 # 2 – Cluster-Voraussetzungen pruefen
 # ---------------------------------------------------------------------------
+
+# Der Rollout laeuft viele Minuten ohne Ausgabe. Reisst die SSH-Sitzung ab,
+# stirbt helmfile mitten im Upgrade und hinterlaesst Releases in
+# pending-upgrade, die den naechsten Lauf blockieren.
+if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
+  warn "Der Rollout haengt an dieser SSH-Sitzung und dauert viele Minuten ohne Ausgabe."
+  warn "Empfehlung: abbrechen und in 'tmux' erneut starten - tmux new -s deploy"
+  read -r -p "Trotzdem fortfahren? [ja/NEIN] " a
+  [[ "$a" == "ja" ]] || die "Abgebrochen."
+fi
+
+log "Haengende Helm-Releases pruefen"
+mapfile -t stuck < <(helm list -n "$NS" --pending -q 2>/dev/null || true)
+if (( ${#stuck[@]} > 0 )); then
+  warn "Diese Releases haengen in einem pending-Status: ${stuck[*]}"
+  warn "Ein neuer Lauf scheitert daran. Aufloesen mit:"
+  for r in "${stuck[@]}"; do
+    warn "  helm rollback ${r} -n ${NS}   # oder: helm uninstall ${r} -n ${NS}"
+  done
+  die "Abbruch."
+fi
+echo "  keine haengenden Releases"
 
 log "Cluster pruefen"
 "$KUBECTL" get node >/dev/null 2>&1 || die "Kein erreichbarer Cluster. journalctl -u k3s -n 100"
@@ -245,6 +278,37 @@ EOF
   fi
 }
 
+# ---------------------------------------------------------------------------
+# 4b – Wechsel zwischen Staging und Produktion
+#
+# cert-manager erneuert ein Zertifikat NICHT, nur weil der ACME-Endpunkt sich
+# geaendert hat - das vorhandene Secret ist ja formal noch gueltig. Beim
+# Wechsel muessen die TLS-Secrets deshalb weg, sonst bleibt das alte
+# Zertifikat liegen und NiFi scheitert weiter am Truststore.
+# ---------------------------------------------------------------------------
+
+log "Vorhandene Zertifikate gegen den ACME-Modus pruefen"
+stale=0
+while read -r secret; do
+  [[ -n "$secret" ]] || continue
+  issuer=$("$KUBECTL" -n "$NS" get secret "$secret" -o jsonpath='{.data.tls\.crt}' 2>/dev/null \
+    | base64 -d 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null || true)
+  [[ -n "$issuer" ]] || continue
+  is_staging=false
+  grep -q "STAGING" <<<"$issuer" && is_staging=true
+  if [[ "$is_staging" != "$LETSENCRYPT_STAGING" ]]; then
+    echo "  ${secret}: Aussteller passt nicht zum Modus - wird verworfen"
+    "$KUBECTL" -n "$NS" delete secret "$secret" >/dev/null 2>&1 || true
+    stale=$((stale+1))
+  fi
+done < <("$KUBECTL" -n "$NS" get secret -l cert-manager.io/certificate-name \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+if (( stale > 0 )); then
+  echo "  ${stale} Secret(s) entfernt, cert-manager stellt neu aus"
+else
+  echo "  nichts zu tun"
+fi
+
 log "CoreDNS-Split-Horizon setzen"
 fqdns=()
 for h in "${CORE_HOSTS[@]}"; do fqdns+=("${h}.${DOMAIN}"); done
@@ -273,8 +337,24 @@ else
 fi
 
 log "Secret custom-ca-cert (Truststore fuer NiFi)"
+# NiFi prueft ausgehende TLS-Verbindungen gegen diesen Truststore. Enthaelt er
+# die falsche Wurzel, stirbt der Pod in CrashLoopBackOff mit
+#   SunCertPathBuilderException: unable to find valid certification path
+# Im Staging-Modus wird nicht von ISRG signiert, sondern von der Staging-CA -
+# deren Wurzel muss dann zusaetzlich hinein.
 [[ -f "$ISRG_PEM" ]] || curl -fsSL -o "$ISRG_PEM" https://letsencrypt.org/certs/isrgrootx1.pem
-"$KUBECTL" create secret generic custom-ca-cert -n "$NS" --from-file=ca.crt="$ISRG_PEM" \
+CA_BUNDLE="$ISRG_PEM"
+if [[ "$LETSENCRYPT_STAGING" == "true" ]]; then
+  STG_PEM="/opt/civitas/letsencrypt-stg-root-x1.pem"
+  [[ -f "$STG_PEM" ]] || curl -fsSL -o "$STG_PEM" https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem \
+    || warn "Staging-Root nicht abrufbar - NiFi wird mit Staging-Zertifikaten scheitern."
+  if [[ -s "$STG_PEM" ]]; then
+    CA_BUNDLE="/opt/civitas/ca-bundle.pem"
+    cat "$ISRG_PEM" "$STG_PEM" >"$CA_BUNDLE"
+    echo "  Staging-Root ergaenzt"
+  fi
+fi
+"$KUBECTL" create secret generic custom-ca-cert -n "$NS" --from-file=ca.crt="$CA_BUNDLE" \
   --dry-run=client -o yaml | "$KUBECTL" apply -f - >/dev/null
 echo "  gesetzt"
 
@@ -292,6 +372,14 @@ log "Deployment-Verzeichnis unter ${WORK_DIR} aufbauen"
 mkdir -p "$WORK_DIR"
 rm -rf "$REPO_COPY"
 cp -a "$CIVITAS_DIR" "$REPO_COPY"
+
+# Wie im offiziellen justfile (Target "deploy"): defaults/deployment nach deployment/
+# im Repo-Root kopieren, damit '../helmfile-root.yaml.gotmpl' aus den Helmfiles dort
+# auf das tatsaechlich vorhandene helmfile-root.yaml.gotmpl im Repo-Root zeigt.
+[[ -d "${REPO_COPY}/defaults/deployment" ]] \
+  || die "${REPO_COPY}/defaults/deployment fehlt - die Repo-Struktur weicht von der erwarteten ab."
+rm -rf "$DEPLOY_DIR"
+cp -a "${REPO_COPY}/defaults/deployment" "$DEPLOY_DIR"
 
 for f in "$HELMFILE_OPERATORS" "$HELMFILE_INSTANCE"; do
   [[ -f "$f" ]] || die "${f} fehlt - die Repo-Struktur weicht von der erwarteten ab.
