@@ -186,7 +186,15 @@ LoginGraceTime 30
 ClientAliveInterval 300
 ClientAliveCountMax 2
 EOF
-  sshd -t || die "sshd-Konfiguration ist fehlerhaft, Abbruch bevor der Zugang kaputtgeht."
+  # /run liegt auf tmpfs und ist nach jedem Boot leer. sshd legt das
+  # Privilege-Separation-Verzeichnis beim Start selbst an - wurde der Dienst
+  # seit dem Boot nie gestartet (nach civitas-firstboot fehlen die Host-Keys,
+  # ohne sie startet sshd nicht), existiert es nicht, und "sshd -t" bricht mit
+  # "Missing privilege separation directory" ab.
+  install -d -m 0755 -o root -g root /run/sshd
+  ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1 || ssh-keygen -A
+
+  /usr/sbin/sshd -t || die "sshd-Konfiguration ist fehlerhaft, Abbruch bevor der Zugang kaputtgeht."
   systemctl restart ssh
 
   if [[ ! -s "${ADMIN_HOME}/.ssh/authorized_keys" && "$ADMIN_USER" != "root" ]]; then
