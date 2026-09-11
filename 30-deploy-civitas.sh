@@ -186,11 +186,22 @@ EOF
 apply_coredns_hosts() {  # $@ = FQDNs
   local entries=""
   for fqdn in "$@"; do
-    entries+="      ${NODE_IP} ${fqdn}"$'\n'
+    entries+="        ${NODE_IP} ${fqdn}"$'\n'
   done
   # In k3s NICHT die coredns-ConfigMap editieren - die wird vom Auto-Deploy-
   # Controller beim Neustart ueberschrieben. Der vorgesehene Weg ist die
   # ConfigMap coredns-custom, die das Corefile per import einbindet.
+  #
+  # WICHTIG: Schluessel auf .server, nicht auf .override. Ein .override landet
+  # im bestehenden .:53-Block, und dort steht bereits
+  #   hosts /etc/coredns/NodeHosts
+  # aus dem k3s-Standard-Corefile. CoreDNS bricht dann beim Start ab mit
+  #   plugin/hosts: this plugin can only be used once per Server Block
+  # Ein .server erzeugt stattdessen einen eigenen Server-Block fuer die Domain,
+  # in dem hosts nur einmal vorkommt.
+  #
+  # fallthrough + forward sorgen dafuer, dass alle anderen Namen unter dieser
+  # Domain weiterhin ueber den normalen Resolver aufgeloest werden.
   cat <<EOF | "$KUBECTL" apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -198,19 +209,34 @@ metadata:
   name: coredns-custom
   namespace: kube-system
 data:
-  civitas.override: |
-    hosts {
-${entries}      fallthrough
+  civitas.server: |
+    ${DOMAIN}:53 {
+      errors
+      cache 30
+      hosts {
+${entries}        fallthrough
+      }
+      forward . /etc/resolv.conf
     }
 EOF
+  # Rueckstaende aus aelteren Laeufen entfernen, sonst wird weiterhin ein
+  # zweiter hosts-Block in den .:53-Block importiert.
+  "$KUBECTL" -n kube-system patch cm coredns-custom --type=json \
+    -p='[{"op":"remove","path":"/data/civitas.override"}]' >/dev/null 2>&1 || true
+
   "$KUBECTL" -n kube-system rollout restart deployment coredns >/dev/null
-  "$KUBECTL" -n kube-system rollout status deployment coredns --timeout=120s >/dev/null
+  if ! "$KUBECTL" -n kube-system rollout status deployment coredns --timeout=120s >/dev/null; then
+    warn "CoreDNS kommt nicht hoch. Ursache ansehen:"
+    warn "  kubectl -n kube-system logs deploy/coredns --tail=20"
+    warn "Notbremse: kubectl -n kube-system delete cm coredns-custom && kubectl -n kube-system rollout restart deployment coredns"
+    return 1
+  fi
 }
 
 log "CoreDNS-Split-Horizon setzen"
 fqdns=()
 for h in "${CORE_HOSTS[@]}"; do fqdns+=("${h}.${DOMAIN}"); done
-apply_coredns_hosts "${fqdns[@]}"
+apply_coredns_hosts "${fqdns[@]}" || die "CoreDNS-Konfiguration fehlgeschlagen - siehe Hinweise oben."
 printf '  %s\n' "${fqdns[@]}"
 
 # ---------------------------------------------------------------------------

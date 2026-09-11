@@ -137,7 +137,12 @@ eintragen, dann ist das Image bit-genau wiederholbar.
   `context deadline exceeded`.
 * **CoreDNS in k3s nicht per `kubectl edit configmap coredns` anfassen.** Der
   Auto-Deploy-Controller überschreibt das beim Neustart. Der Split-Horizon läuft
-  über die ConfigMap `coredns-custom`.
+  über die ConfigMap `coredns-custom` — und dort mit dem Schlüssel `civitas.server`,
+  nicht `civitas.override`. Ein `.override` wird in den bestehenden `.:53`-Block
+  importiert, in dem k3s bereits `hosts /etc/coredns/NodeHosts` stehen hat; CoreDNS
+  bricht dann mit `plugin/hosts: this plugin can only be used once per Server Block`
+  ab und geht in CrashLoopBackOff. Notbremse, falls das passiert:
+  `kubectl -n kube-system delete cm coredns-custom && kubectl -n kube-system rollout restart deployment coredns`.
 * **`write-kubeconfig-mode: "0600"`** – `kubectl` ohne `sudo` scheitert mit
   `permission denied`. `25-postclone-setup.sh` legt deshalb eine Kopie unter
   `~/.kube/config` des aufrufenden Benutzers an.
