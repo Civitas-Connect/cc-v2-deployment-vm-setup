@@ -6,7 +6,7 @@
 #   - ClusterIssuer (Let's Encrypt prod oder staging)
 #   - CoreDNS-Split-Horizon ueber die coredns-custom ConfigMap
 #   - Namespace, keycloak-smtp, custom-ca-cert
-#   - global.yaml.gotmpl rendern und helmfile sync
+#   - global.yaml.gotmpl rendern, dann helmfile-operators und helmfile-instance
 #   - CoreDNS-Eintraege aus den tatsaechlichen Ingresses nachziehen
 #
 # Voraussetzung: /etc/civitas/deploy.env (Vorlage: /etc/civitas/deploy.env.example)
@@ -24,6 +24,15 @@ warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Bitte mit sudo ausfuehren."
+
+# In ein stabiles Verzeichnis wechseln, das dieses Skript garantiert nicht anfasst.
+# Wurde das Skript aus /opt/civitas/rendered/... heraus aufgerufen (z.B. weil man
+# vorher zum Debuggen dorthin gecd't hat), reisst der spaetere rm -rf/cp -a des
+# Repo-Copys (Schritt 7) genau dieses Arbeitsverzeichnis unter dem laufenden Prozess
+# weg. Jeder folgende getcwd()-Aufruf - auch in helmfile selbst - schlaegt dann mit
+# "no such file or directory" fehl, obwohl unter demselben Pfad laengst wieder ein
+# frisches Verzeichnis existiert (neue Inode, alte cwd-Bindung ist aber tot).
+cd /opt/civitas || die "cd /opt/civitas fehlgeschlagen"
 
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 KUBECTL=/usr/local/bin/kubectl
@@ -63,6 +72,20 @@ EXTRA_HOSTS="${EXTRA_HOSTS:-}"
 NS="$INSTANCE_SLUG"
 CIVITAS_DIR="${CIVITAS_DIR:-/opt/civitas/civitas-core-deployment}"
 WORK_DIR="/opt/civitas/rendered"
+# Das gesamte Repo wird kopiert, nicht nur defaults/deployment: helmfile-root.yaml.gotmpl
+# liegt im Repo-Root, und defaults/deployment/*.yaml(.gotmpl) referenzieren es ueber
+# '../helmfile-root.yaml.gotmpl' - das funktioniert nur, wenn das Deployment-Verzeichnis
+# EINE Ebene direkt unter dem Repo-Root liegt, nicht zwei (wie defaults/deployment es tut).
+# Genau deshalb kopiert auch das offizielle justfile (Target "deploy") vor jedem Lauf
+# "defaults/deployment" nach "deployment" im Repo-Root - das bilden wir unten nach.
+REPO_COPY="${WORK_DIR}/repo"
+DEPLOY_DIR="${REPO_COPY}/deployment"
+# Zwei Einstiegspunkte, in dieser Reihenfolge. helmfile.yaml im selben
+# Verzeichnis ist NICHT der richtige Einstieg - sie verweist auf eine
+# helmfile-root.yaml.gotmpl, die (nur) im Repo-Root liegt.
+HELMFILE_OPERATORS="${DEPLOY_DIR}/helmfile-operators.yaml"
+HELMFILE_INSTANCE="${DEPLOY_DIR}/helmfile-instance.yaml.gotmpl"
+OPERATOR_NS="${OPERATOR_NS:-civitas-operators}"
 ISRG_PEM="/opt/civitas/isrg-root-x1.pem"
 
 if [[ -z "${NODE_IP:-}" ]]; then
@@ -129,8 +152,8 @@ fi
 
 if [[ "$MODE" == "reset" ]]; then
   log "Instanz ${NS} zuruecksetzen"
-  if [[ -d "${WORK_DIR}/deployment" ]]; then
-    helmfile -f "${WORK_DIR}/deployment/helmfile.yaml" destroy -e production || warn "helmfile destroy mit Fehlern"
+  if [[ -f "$HELMFILE_INSTANCE" ]]; then
+    helmfile -f "$HELMFILE_INSTANCE" destroy -e production || warn "helmfile destroy mit Fehlern"
   fi
   "$KUBECTL" delete namespace "$NS" --wait=false 2>/dev/null || true
   for _ in $(seq 1 30); do
@@ -278,10 +301,24 @@ fi
 log "Deployment-Verzeichnis unter ${WORK_DIR} aufbauen"
 [[ -d "$CIVITAS_DIR" ]] || die "$CIVITAS_DIR fehlt - im Template wurde das Repo nicht geklont."
 mkdir -p "$WORK_DIR"
-rm -rf "${WORK_DIR}/deployment"
-cp -r "${CIVITAS_DIR}/defaults/deployment" "${WORK_DIR}/deployment"
+rm -rf "$REPO_COPY"
+cp -a "$CIVITAS_DIR" "$REPO_COPY"
 
-GLOBAL="${WORK_DIR}/deployment/environments/production/global.yaml.gotmpl"
+# Wie im offiziellen justfile (Target "deploy"): defaults/deployment nach deployment/
+# im Repo-Root kopieren, damit '../helmfile-root.yaml.gotmpl' aus den Helmfiles dort
+# auf das tatsaechlich vorhandene helmfile-root.yaml.gotmpl im Repo-Root zeigt.
+[[ -d "${REPO_COPY}/defaults/deployment" ]] \
+  || die "${REPO_COPY}/defaults/deployment fehlt - die Repo-Struktur weicht von der erwarteten ab."
+rm -rf "$DEPLOY_DIR"
+cp -a "${REPO_COPY}/defaults/deployment" "$DEPLOY_DIR"
+
+for f in "$HELMFILE_OPERATORS" "$HELMFILE_INSTANCE"; do
+  [[ -f "$f" ]] || die "${f} fehlt - die Repo-Struktur weicht von der erwarteten ab.
+Vorhanden in ${DEPLOY_DIR}:
+$(ls -1 "$DEPLOY_DIR" 2>/dev/null | sed 's/^/  /')"
+done
+
+GLOBAL="${DEPLOY_DIR}/environments/production/global.yaml.gotmpl"
 mkdir -p "$(dirname "$GLOBAL")"
 cat >"$GLOBAL" <<EOF
 ---
@@ -302,20 +339,57 @@ global:
 EOF
 echo "  global.yaml.gotmpl geschrieben"
 
-HELMFILE_ARGS=(-f "${WORK_DIR}/deployment/helmfile.yaml")
-
 # ---------------------------------------------------------------------------
 # 8 – Rollout
 # ---------------------------------------------------------------------------
 
 if [[ "$MODE" == "diff" ]]; then
   log "helmfile diff (Vorschau)"
-  helmfile "${HELMFILE_ARGS[@]}" diff -e production || true
+  helmfile -f "$HELMFILE_OPERATORS" diff -e production || true
+  helmfile -f "$HELMFILE_INSTANCE"  diff -e production || true
   exit 0
 fi
 
-log "helmfile sync (dauert beim ersten Mal einige Minuten)"
-helmfile "${HELMFILE_ARGS[@]}" sync -e production
+log "Operatoren ausrollen (Namespace ${OPERATOR_NS})"
+if ! helmfile -f "$HELMFILE_OPERATORS" sync -e production; then
+  die "helmfile-operators ist fehlgeschlagen. Ursache ansehen:
+  cd ${DEPLOY_DIR} && sudo helmfile -f helmfile-operators.yaml -e production --log-level debug sync"
+fi
+
+# Die Operatoren bringen Admission-Webhooks mit. Startet der Instanz-Teil zu
+# frueh, scheitert das Release postgres-cluster reproduzierbar mit
+#   failed calling webhook "mcluster.cnpg.io" ... context deadline exceeded
+log "Warten, bis die Operator-Webhooks bereit sind"
+if "$KUBECTL" -n "$OPERATOR_NS" wait --for=condition=Available deploy --all --timeout=300s >/dev/null 2>&1; then
+  echo "  Operatoren bereit"
+else
+  warn "Nicht alle Operator-Deployments sind nach 5 Minuten Available:"
+  "$KUBECTL" -n "$OPERATOR_NS" get pods 2>/dev/null | sed 's/^/    /'
+  warn "Der naechste Schritt kann am CNPG-Webhook scheitern."
+fi
+sleep 15
+
+log "Instanz ausrollen (dauert beim ersten Mal einige Minuten)"
+if ! helmfile -f "$HELMFILE_INSTANCE" sync -e production; then
+  die "helmfile-instance ist fehlgeschlagen. Ursache ansehen:
+  cd ${DEPLOY_DIR} && sudo helmfile -f helmfile-instance.yaml.gotmpl -e production --log-level debug sync
+
+Scheitert das Release postgres-cluster am Webhook mcluster.cnpg.io, ist der
+CNPG-Operator noch nicht bereit. Pruefen mit:
+  kubectl -n ${OPERATOR_NS} get pods
+und danach dieses Skript erneut aufrufen."
+fi
+
+# helmfile beendet sich auch dann mit 0, wenn es gar keine Releases gefunden
+# hat - etwa bei abweichender Repo-Struktur oder falschem Environment.
+releases=$(helm list -n "$NS" -q 2>/dev/null | wc -l)
+if (( releases == 0 )); then
+  warn "helmfile lief durch, aber im Namespace ${NS} existiert kein Release."
+  warn "Was helmfile ueberhaupt sieht:"
+  warn "  cd ${DEPLOY_DIR} && sudo helmfile -f helmfile-instance.yaml.gotmpl -e production list"
+  die "Kein Rollout erfolgt - Abbruch."
+fi
+echo "  ${releases} Release(s) im Namespace ${NS}"
 
 # ---------------------------------------------------------------------------
 # 9 – CoreDNS aus den echten Ingresses nachziehen
@@ -337,6 +411,11 @@ fi
 # ---------------------------------------------------------------------------
 
 log "Warte auf Zertifikate (bis zu 10 Minuten)"
+if [[ "$("$KUBECTL" get certificate -n "$NS" --no-headers 2>/dev/null | wc -l)" == "0" ]]; then
+  warn "Es existiert kein einziges Certificate-Objekt - Warten waere sinnlos."
+  warn "Pruefen: kubectl -n ${NS} get ingress && kubectl -n ${NS} get events --sort-by=.lastTimestamp | tail -20"
+  die "Abbruch."
+fi
 deadline=$(( $(date +%s) + 600 ))
 while (( $(date +%s) < deadline )); do
   total=$("$KUBECTL" get certificate -n "$NS" --no-headers 2>/dev/null | wc -l)
@@ -377,7 +456,7 @@ Deployment abgeschlossen.
 Nuetzlich:
   kubectl get pods -n ${NS} -w
   kubectl get certificate,order,challenge -n ${NS}
-  helmfile -f ${WORK_DIR}/deployment/helmfile.yaml apply -e production --selector component=keycloak
+  helmfile -f "$HELMFILE_INSTANCE" apply -e production --selector component=keycloak
   sudo $0 --reset      # Instanz komplett neu aufbauen
 ------------------------------------------------------------------
 EOF
