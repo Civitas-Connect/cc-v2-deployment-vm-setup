@@ -143,9 +143,12 @@ eintragen, dann ist das Image bit-genau wiederholbar.
   bricht dann mit `plugin/hosts: this plugin can only be used once per Server Block`
   ab und geht in CrashLoopBackOff. Notbremse, falls das passiert:
   `kubectl -n kube-system delete cm coredns-custom && kubectl -n kube-system rollout restart deployment coredns`.
-* **`write-kubeconfig-mode: "0600"`** – `kubectl` ohne `sudo` scheitert mit
-  `permission denied`. `25-postclone-setup.sh` legt deshalb eine Kopie unter
-  `~/.kube/config` des aufrufenden Benutzers an.
+* **`kubectl` ohne `sudo`** läuft über die Gruppe `civitas`: k3s schreibt die
+  kubeconfig mit `write-kubeconfig-mode: "0640"` und `write-kubeconfig-group: "civitas"`,
+  der Admin-Benutzer ist Mitglied. Das überlebt auch eine Zertifikatsrotation — eine
+  Kopie unter `~/.kube/config` nicht, deren CA passt danach nicht mehr. Die
+  Gruppenmitgliedschaft greift erst nach einer **neuen Anmeldung**. Prüfen mit
+  `stat -c '%a %G' /etc/rancher/k3s/k3s.yaml` — erwartet ist `640 civitas`.
 * **IP-Konflikt beim Klonen.** `25-postclone-setup.sh` pingt die Zieladresse vorab
   und bricht ab, wenn sie schon jemandem gehört.
 * **Kaputtes Netplan-YAML.** Vor `netplan apply` läuft `netplan generate`; schlägt
@@ -164,9 +167,70 @@ eintragen, dann ist das Image bit-genau wiederholbar.
   `25-postclone-setup.sh` wartet deshalb auf die NTP-Synchronisation, bevor es k3s
   anfasst, erkennt Zertifikate mit Zukunftsdatum und rotiert sie automatisch.
   Von Hand: `sudo k3s certificate rotate` nach `timedatectl set-ntp true`.
-* **`10-build-template.sh` nicht über eine nackte SSH-Sitzung laufen lassen.**
-  `apt-get upgrade` arbeitet minutenlang ohne Ausgabe; reißt die Verbindung ab,
-  bleibt dpkg auf halbem Weg stehen. Das Skript warnt und empfiehlt `tmux`.
+* **`10-build-template.sh` und `30-deploy-civitas.sh` nicht über eine nackte
+  SSH-Sitzung laufen lassen.** Beide arbeiten minutenlang ohne Ausgabe; reißt die
+  Verbindung ab, bleibt dpkg auf halbem Weg stehen bzw. Helm-Releases hängen in
+  `pending-upgrade`. Beide Skripte warnen und empfehlen `tmux`; das Deployment
+  bricht zusätzlich ab, wenn es hängende Releases vorfindet, und nennt den
+  `helm rollback`-Befehl dazu.
+* **Paketspiegel.** `archive.ubuntu.com` war in dieser Umgebung nicht erreichbar,
+  während `de.archive.ubuntu.com` 79 MB/s lieferte. Wirkt wie ein Hänger im Build,
+  ist aber ein toter Mirror — prüfen mit
+  `curl -o /dev/null -w '%{speed_download}\n' --max-time 30 http://archive.ubuntu.com/ubuntu/ls-lR.gz`.
+* **Repo-Layout.** `defaults/deployment` ist eine Vorlage; ihre Helmfiles laden
+  `../helmfile-root.yaml.gotmpl` aus dem Repo-Root. Das Verzeichnis muss deshalb als
+  `deployment/` direkt unter dem Repo-Root liegen — genau das macht auch das offizielle
+  `justfile`. Einstiegspunkte sind `helmfile-operators.yaml` und
+  `helmfile-instance.yaml.gotmpl`, nicht `helmfile.yaml`.
+
+## Von einem anderen Tag oder Branch deployen
+
+`CIVITAS_REF` in der `deploy.env` schaltet die Arbeitskopie unter
+`/opt/civitas/rendered/repo` auf einen anderen Stand um; das Repo unter
+`/opt/civitas/civitas-core-deployment` bleibt unberührt. Leer lassen heißt: der Stand
+aus dem Image, bei diesem Template `v2.0-rc2`.
+
+```bash
+CIVITAS_REF=v2.0-rc3     # anderer Tag
+CIVITAS_REF=main         # Branch, wird auf origin/main aufgelöst
+```
+
+Branchnamen werden bewusst gegen `origin/` aufgelöst — ein lokaler Branch stammt sonst
+noch aus der Zeit des Image-Baus. Liegt die Referenz nicht lokal vor, wird gefetcht;
+dafür braucht die VM Zugang zum GitLab.
+
+Zwei Dinge dabei beachten: Die Container-Images im Node passen zum Stand aus dem Image,
+ein anderer Tag lädt also nach. Und die Repo-Struktur kann sich zwischen Versionen
+ändern — erst mit `LETSENCRYPT_STAGING=true` testen.
+
+Soll ein anderer Stand dauerhaft gelten, gehört er ins Image: `CIVITAS_TAG` beim Aufruf
+von `10-build-template.sh` setzen und neu bauen.
+
+## Let's Encrypt: Staging und Produktion
+
+`30-deploy-civitas.sh` erkennt am Aussteller der vorhandenen TLS-Secrets, ob sie zum
+konfigurierten `LETSENCRYPT_STAGING` passen, und verwirft sie beim Wechsel — cert-manager
+erneuert sonst nicht, weil das alte Zertifikat formal noch gültig ist.
+
+Im Staging-Modus landet zusätzlich die Staging-Wurzel im Secret `custom-ca-cert`. Ohne
+das stirbt NiFi in CrashLoopBackOff mit `SunCertPathBuilderException: unable to find
+valid certification path` — der Truststore enthält dann nur das ISRG-Root, das zur
+Staging-Kette nicht passt.
+
+Prüfen, was tatsächlich ausgeliefert wird:
+
+```bash
+echo | openssl s_client -connect 127.0.0.1:443 -servername idm.<domain> 2>/dev/null \
+  | openssl x509 -noout -issuer -dates
+```
+
+Rate Limits der Produktions-CA: fünf fehlgeschlagene Validierungen pro Konto und Stunde,
+50 Zertifikate pro registrierter Domain und Woche. Bei einer neuen Domain oder einer neuen
+NAT-Adresse lohnt ein Vorabtest von außerhalb des Netzes, bevor man auf Produktion geht:
+
+```bash
+curl -I --max-time 10 http://<öffentliche-ip>/.well-known/acme-challenge/test   # 404 = gut
+```
 
 ## Varianten beim Sysprep
 

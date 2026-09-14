@@ -71,6 +71,10 @@ EXTRA_HOSTS="${EXTRA_HOSTS:-}"
 
 NS="$INSTANCE_SLUG"
 CIVITAS_DIR="${CIVITAS_DIR:-/opt/civitas/civitas-core-deployment}"
+# Tag oder Branch, von dem deployt wird. Leer = Stand nehmen, der im Image
+# ausgecheckt ist. Sonst wird in der Arbeitskopie umgeschaltet, das Repo unter
+# CIVITAS_DIR bleibt unberuehrt.
+CIVITAS_REF="${CIVITAS_REF:-}"
 WORK_DIR="/opt/civitas/rendered"
 # Das gesamte Repo wird kopiert, nicht nur defaults/deployment: helmfile-root.yaml.gotmpl
 # liegt im Repo-Root, und defaults/deployment/*.yaml(.gotmpl) referenzieren es ueber
@@ -112,7 +116,8 @@ printf '  Domain          : %s\n' "$DOMAIN"
 printf '  Instance / NS   : %s\n' "$INSTANCE_SLUG"
 printf '  Node-IP         : %s\n' "$NODE_IP"
 printf '  ACME            : %s\n' "$([[ "$LETSENCRYPT_STAGING" == "true" ]] && echo staging || echo production)"
-printf '  Repo-Tag        : %s\n' "$(git -C "$CIVITAS_DIR" describe --tags --always 2>/dev/null || echo '?')"
+printf '  Repo-Stand      : %s\n' "$(git -C "$CIVITAS_DIR" describe --tags --always 2>/dev/null || echo '?')"
+printf '  Deploy-Ref      : %s\n' "${CIVITAS_REF:-<Stand im Image>}"
 
 # ---------------------------------------------------------------------------
 # 2 – Cluster-Voraussetzungen pruefen
@@ -372,6 +377,32 @@ log "Deployment-Verzeichnis unter ${WORK_DIR} aufbauen"
 mkdir -p "$WORK_DIR"
 rm -rf "$REPO_COPY"
 cp -a "$CIVITAS_DIR" "$REPO_COPY"
+
+# Auf einen anderen Tag oder Branch umschalten - nur in der Arbeitskopie.
+if [[ -n "$CIVITAS_REF" ]]; then
+  log "Auf ${CIVITAS_REF} umschalten"
+  git config --global --add safe.directory "$REPO_COPY" 2>/dev/null || true
+
+  if ! git -C "$REPO_COPY" rev-parse --verify --quiet "${CIVITAS_REF}^{commit}" >/dev/null; then
+    echo "  ${CIVITAS_REF} liegt nicht lokal vor, hole vom Remote"
+    git -C "$REPO_COPY" fetch --all --tags --prune --quiet \
+      || die "git fetch fehlgeschlagen - ohne Netz kann ${CIVITAS_REF} nicht geholt werden."
+  fi
+
+  target="$CIVITAS_REF"
+  # Branchnamen auf den Remote-Stand aufloesen, sonst landet man auf einem
+  # veralteten lokalen Branch aus der Zeit des Image-Baus.
+  if git -C "$REPO_COPY" rev-parse --verify --quiet "refs/remotes/origin/${CIVITAS_REF}" >/dev/null; then
+    target="origin/${CIVITAS_REF}"
+  fi
+
+  git -C "$REPO_COPY" checkout --quiet --detach "$target" \
+    || die "Checkout von ${CIVITAS_REF} fehlgeschlagen. Verfuegbar:
+$(git -C "$REPO_COPY" tag | tail -10 | sed 's/^/  /')
+$(git -C "$REPO_COPY" branch -r | sed 's/^/  /')"
+
+  echo "  jetzt auf: $(git -C "$REPO_COPY" describe --tags --always 2>/dev/null) ($(git -C "$REPO_COPY" log -1 --format=%h\ %s))"
+fi
 
 # Wie im offiziellen justfile (Target "deploy"): defaults/deployment nach deployment/
 # im Repo-Root kopieren, damit '../helmfile-root.yaml.gotmpl' aus den Helmfiles dort

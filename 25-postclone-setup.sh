@@ -423,14 +423,29 @@ else
     fi
   fi
 
-  # kubeconfig fuer den aufrufenden Benutzer auffrischen
+  # kubectl ohne sudo: Gruppenmitgliedschaft statt Kopie. k3s setzt Modus und
+  # Gruppe der kubeconfig bei jedem Start neu, das ueberlebt eine
+  # Zertifikatsrotation - eine Kopie unter ~/.kube/config nicht.
+  KUBE_GROUP="${KUBE_GROUP:-civitas}"
   admin="${SUDO_USER:-}"
-  if [[ -n "$admin" && "$admin" != "root" && -r /etc/rancher/k3s/k3s.yaml ]]; then
-    home=$(getent passwd "$admin" | cut -d: -f6)
-    if [[ -n "$home" ]]; then
-      install -d -o "$admin" -g "$admin" -m 0700 "${home}/.kube"
-      install -o "$admin" -g "$admin" -m 0600 /etc/rancher/k3s/k3s.yaml "${home}/.kube/config"
-      ok "kubeconfig fuer ${admin} aktualisiert"
+  if [[ -n "$admin" && "$admin" != "root" ]]; then
+    getent group "$KUBE_GROUP" >/dev/null || groupadd --system "$KUBE_GROUP"
+    if ! id -nG "$admin" | tr ' ' '\n' | grep -qx "$KUBE_GROUP"; then
+      usermod -aG "$KUBE_GROUP" "$admin"
+      warn "${admin} zur Gruppe ${KUBE_GROUP} hinzugefuegt - erst nach neuer Anmeldung wirksam."
+    fi
+    perms=$(stat -c '%a %G' /etc/rancher/k3s/k3s.yaml 2>/dev/null || echo '?')
+    if [[ "$perms" == "640 ${KUBE_GROUP}" ]]; then
+      ok "kubectl ohne sudo nutzbar (kubeconfig ${perms})"
+    else
+      warn "kubeconfig steht auf ${perms}, erwartet 640 ${KUBE_GROUP}."
+      warn "Das Image stammt aus einer aelteren Version von 10-build-template.sh."
+      warn "Nachziehen: in /etc/rancher/k3s/config.yaml write-kubeconfig-mode 0640 und"
+      warn "write-kubeconfig-group ${KUBE_GROUP} setzen, dann systemctl restart k3s"
+    fi
+    if [[ -f "$(getent passwd "$admin" | cut -d: -f6)/.kube/config" ]]; then
+      warn "Es existiert noch ~/.kube/config - nach einer Rotation passt dessen CA nicht mehr."
+      warn "Entfernen mit: rm ~/.kube/config"
     fi
   fi
 fi

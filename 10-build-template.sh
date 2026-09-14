@@ -71,6 +71,7 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Bitte mit sudo ausfuehren."
 
+KUBE_GROUP="${KUBE_GROUP:-civitas}"
 ADMIN_USER="${SUDO_USER:-root}"
 ADMIN_HOME=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
 [[ -n "$ADMIN_HOME" ]] || die "Home-Verzeichnis von $ADMIN_USER nicht gefunden."
@@ -116,6 +117,14 @@ if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
   read -r -p "Trotzdem fortfahren? [ja/NEIN] " a
   [[ "$a" == "ja" ]] || die "Abgebrochen."
 fi
+
+log "Gruppe ${KUBE_GROUP} fuer kubectl-Zugriff"
+getent group "$KUBE_GROUP" >/dev/null || groupadd --system "$KUBE_GROUP"
+if [[ "$ADMIN_USER" != "root" ]] && ! id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx "$KUBE_GROUP"; then
+  usermod -aG "$KUBE_GROUP" "$ADMIN_USER"
+  warn "${ADMIN_USER} wurde der Gruppe ${KUBE_GROUP} hinzugefuegt - erst nach einer neuen Anmeldung wirksam."
+fi
+echo "  ${KUBE_GROUP}: $(getent group "$KUBE_GROUP" | cut -d: -f4)"
 
 log "Grundsystem und Basis-Pakete"
   export DEBIAN_FRONTEND=noninteractive
@@ -459,19 +468,36 @@ disable:
 # NetworkPolicies sind im V2-Deployment deaktiviert
 disable-network-policy: true
 
-write-kubeconfig-mode: "0600"
+# 0640 plus Gruppe statt 0600: Mitglieder der Gruppe koennen kubectl ohne
+# sudo benutzen, ohne dass die Datei fuer alle lesbar wird. k3s setzt Modus
+# und Gruppe bei jedem Start neu - das ueberlebt auch eine Zertifikatsrotation,
+# anders als eine Kopie unter ~/.kube/config.
+write-kubeconfig-mode: "0640"
+write-kubeconfig-group: "civitas"
 kubelet-arg:
   - "image-gc-high-threshold=80"
   - "image-gc-low-threshold=70"
 EOF
 
   INSTALL_ARGS=()
+  # Bei einer bereits installierten Instanz greift die geaenderte config.yaml
+  # erst nach einem Neustart des Dienstes.
+  NEEDS_K3S_RESTART=false
+  systemctl is-active --quiet k3s && NEEDS_K3S_RESTART=true
   if [[ -n "$K3S_VERSION" ]]; then
     export INSTALL_K3S_VERSION="$K3S_VERSION"
   else
     export INSTALL_K3S_CHANNEL="stable"
   fi
   curl -sfL https://get.k3s.io | sh -s - server "${INSTALL_ARGS[@]}"
+  if $NEEDS_K3S_RESTART; then
+    systemctl restart k3s
+    for _ in $(seq 1 60); do
+      [[ "$(stat -c '%a %G' /etc/rancher/k3s/k3s.yaml 2>/dev/null)" == "640 ${KUBE_GROUP}" ]] && break
+      sleep 5
+    done
+  fi
+  echo "  kubeconfig: $(stat -c '%a %U:%G' /etc/rancher/k3s/k3s.yaml 2>/dev/null)"
 
   systemctl enable k3s
   log "Warte auf Node Ready"
@@ -481,11 +507,16 @@ EOF
   done
   "$KUBECTL" get node -o wide || die "k3s ist nicht hochgekommen. Logs: journalctl -u k3s -n 200"
 
-  log "kubeconfig fuer ${ADMIN_USER} bereitstellen"
-  install -d -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0700 "${ADMIN_HOME}/.kube"
-  install -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0600 /etc/rancher/k3s/k3s.yaml "${ADMIN_HOME}/.kube/config"
   echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' >/etc/profile.d/kubeconfig.sh
   chmod 0644 /etc/profile.d/kubeconfig.sh
+fi
+
+# Eine alte Kopie wuerde gegen die Gruppenloesung arbeiten: nach einer
+# Zertifikatsrotation passt ihre CA nicht mehr, und die Fehlermeldung fuehrt
+# in die Irre.
+if [[ -f "${ADMIN_HOME}/.kube/config" ]]; then
+  mv "${ADMIN_HOME}/.kube/config" "${ADMIN_HOME}/.kube/config.bak-$(date +%Y%m%d)"
+  echo "  veraltete ~/.kube/config nach .bak verschoben"
 fi
 
 # ---------------------------------------------------------------------------
@@ -666,6 +697,26 @@ SMTP_PASSWORD=
 # -----------------------------------------------------------------------------
 # Optional
 # -----------------------------------------------------------------------------
+
+# Tag oder Branch, von dem deployt wird.
+#
+# Leer oder auskommentiert = der Stand, der im Image ausgecheckt ist
+# (bei diesem Template v2.0-rc2). Das ist der Normalfall und der schnellste
+# Weg, weil die Container-Images dazu bereits im Node liegen.
+#
+# Ein abweichender Wert schaltet NUR die Arbeitskopie unter
+# /opt/civitas/rendered/repo um; das Repo unter /opt/civitas/civitas-core-deployment
+# bleibt unangetastet. Liegt die Referenz nicht lokal vor, wird sie vom Remote
+# geholt - dafuer braucht die VM Netzzugang zum GitLab.
+#
+# Beispiele:
+#   CIVITAS_REF=v2.0-rc3     # anderer Tag
+#   CIVITAS_REF=main         # Branch, wird auf origin/main aufgeloest
+#   CIVITAS_REF=a1b2c3d      # einzelner Commit
+#
+# Achtung: Bei einem anderen Stand koennen Repo-Struktur und Image-Versionen
+# abweichen. Erst mit LETSENCRYPT_STAGING=true testen.
+#CIVITAS_REF=
 
 # Pfad zum ausgecheckten civitas-core-deployment-Repo. Nur aendern, wenn im
 # Template ein abweichender Ort verwendet wurde.
