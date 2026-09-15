@@ -156,6 +156,37 @@ for check in "ingress-nginx:daemonset/ingress-nginx-controller" "cert-manager:de
 done
 echo "  ingress-nginx und cert-manager sind vorhanden."
 
+# Vorhanden heisst nicht bereit. Nach dem Klonen startet k3s alle Pods neu;
+# laeuft das Deployment zu frueh los, lehnt der API-Server den ClusterIssuer ab:
+#   failed calling webhook ... cert-manager-webhook ... no endpoints available
+# Der Issuer wird dann nicht angelegt, und der naechste Schritt meldet NotFound.
+log "Warten, bis cert-manager und ingress-nginx bereit sind"
+for d in cert-manager cert-manager-webhook cert-manager-cainjector; do
+  "$KUBECTL" -n cert-manager rollout status "deployment/${d}" --timeout=300s >/dev/null 2>&1 \
+    || warn "  ${d} ist nach 5 Minuten nicht Available"
+done
+"$KUBECTL" -n ingress-nginx rollout status daemonset/ingress-nginx-controller --timeout=300s >/dev/null 2>&1 \
+  || warn "  ingress-nginx-controller ist nach 5 Minuten nicht bereit"
+
+# Entscheidend ist der Endpoint hinter dem Webhook-Service, nicht der Pod-Status:
+# zwischen "Running" und "im Service eingetragen" liegen einige Sekunden.
+webhook_ready=false
+for _ in $(seq 1 60); do
+  eps=$("$KUBECTL" -n cert-manager get endpoints cert-manager-webhook \
+        -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+  if [[ -n "$eps" ]]; then webhook_ready=true; break; fi
+  sleep 5
+done
+if $webhook_ready; then
+  echo "  cert-manager-webhook bereit"
+else
+  warn "cert-manager-webhook hat nach 5 Minuten keine Endpoints."
+  "$KUBECTL" -n cert-manager get pods 2>/dev/null | sed 's/^/    /'
+  die "Ohne den Webhook kann der ClusterIssuer nicht angelegt werden.
+Ursache ansehen:
+  kubectl -n cert-manager describe pod -l app.kubernetes.io/name=webhook | tail -20"
+fi
+
 log "Oeffentliche DNS-Aufloesung pruefen"
 dns_ok=true
 for h in "${CORE_HOSTS[@]}"; do
@@ -203,6 +234,16 @@ fi
 # ---------------------------------------------------------------------------
 
 log "ClusterIssuer letsencrypt-prod"
+apply_with_retry() {  # liest das Manifest von stdin
+  local manifest attempt
+  manifest=$(cat)
+  for attempt in 1 2 3; do
+    if printf '%s\n' "$manifest" | "$KUBECTL" apply -f -; then return 0; fi
+    warn "  Versuch ${attempt} fehlgeschlagen, neuer Versuch in 15 s"
+    sleep 15
+  done
+  return 1
+}
 if [[ "$LETSENCRYPT_STAGING" == "true" ]]; then
   ACME_SERVER="https://acme-staging-v02.api.letsencrypt.org/directory"
 else
@@ -210,7 +251,7 @@ else
 fi
 # Der Name bleibt bewusst letsencrypt-prod, weil die CIVITAS-Ingresses ihn
 # referenzieren. Nur der ACME-Endpunkt wechselt.
-cat <<EOF | "$KUBECTL" apply -f -
+cat <<EOF | apply_with_retry
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -226,6 +267,13 @@ spec:
           ingress:
             ingressClassName: nginx
 EOF
+# apply_with_retry gibt bei Misserfolg nicht 0 zurueck - ohne Issuer ist jedes
+# weitere Ausrollen sinnlos, weil kein Zertifikat ausgestellt werden kann.
+[[ $? -eq 0 ]] || die "ClusterIssuer konnte nicht angelegt werden.
+Meist ist der cert-manager-Webhook nicht erreichbar:
+  kubectl -n cert-manager get pods
+  kubectl -n cert-manager get endpoints cert-manager-webhook"
+
 "$KUBECTL" wait --for=condition=Ready clusterissuer/letsencrypt-prod --timeout=120s \
   || warn "ClusterIssuer noch nicht Ready - kubectl describe clusterissuer letsencrypt-prod"
 
