@@ -75,6 +75,9 @@ CIVITAS_DIR="${CIVITAS_DIR:-/opt/civitas/civitas-core-deployment}"
 # ausgecheckt ist. Sonst wird in der Arbeitskopie umgeschaltet, das Repo unter
 # CIVITAS_DIR bleibt unberuehrt.
 CIVITAS_REF="${CIVITAS_REF:-}"
+# Oeffentliche Adresse, auf die die DNS-Namen zeigen, wenn die Instanz hinter
+# NAT steht. Leer = wird aus der DNS-Aufloesung abgeleitet.
+PUBLIC_IP="${PUBLIC_IP:-}"
 WORK_DIR="/opt/civitas/rendered"
 # Das gesamte Repo wird kopiert, nicht nur defaults/deployment: helmfile-root.yaml.gotmpl
 # liegt im Repo-Root, und defaults/deployment/*.yaml(.gotmpl) referenzieren es ueber
@@ -118,6 +121,7 @@ printf '  Node-IP         : %s\n' "$NODE_IP"
 printf '  ACME            : %s\n' "$([[ "$LETSENCRYPT_STAGING" == "true" ]] && echo staging || echo production)"
 printf '  Repo-Stand      : %s\n' "$(git -C "$CIVITAS_DIR" describe --tags --always 2>/dev/null || echo '?')"
 printf '  Deploy-Ref      : %s\n' "${CIVITAS_REF:-<Stand im Image>}"
+printf '  Oeffentliche IP : %s\n' "${PUBLIC_IP:-<aus DNS ableiten>}"
 
 # ---------------------------------------------------------------------------
 # 2 – Cluster-Voraussetzungen pruefen
@@ -187,19 +191,70 @@ Ursache ansehen:
   kubectl -n cert-manager describe pod -l app.kubernetes.io/name=webhook | tail -20"
 fi
 
+# Zwei gueltige Betriebsarten:
+#
+#   direkt  Die Namen zeigen auf die Node-IP. Nur moeglich, wenn die VM selbst
+#           aus dem Internet erreichbar ist.
+#   NAT     Die Namen zeigen auf eine oeffentliche Adresse, die der Hypervisor
+#           bzw. die Firewall auf die private Node-IP abbildet. Das ist der
+#           Normalfall in einem Rechenzentrumsnetz - und dann ist eine
+#           Abweichung von der Node-IP KEIN Fehler.
+#
+# Entscheidend fuer die HTTP-01-Challenge ist nur, dass alle Namen einheitlich
+# auf dieselbe Adresse zeigen und dass Port 80 von aussen dort ankommt.
 log "Oeffentliche DNS-Aufloesung pruefen"
-dns_ok=true
+
+declare -A seen=()
+dns_missing=false
 for h in "${CORE_HOSTS[@]}"; do
   resolved=$(getent ahostsv4 "${h}.${DOMAIN}" 2>/dev/null | awk 'NR==1{print $1}')
   if [[ -z "$resolved" ]]; then
-    warn "  ${h}.${DOMAIN} loest nicht auf"; dns_ok=false
-  elif [[ "$resolved" != "$NODE_IP" ]]; then
-    warn "  ${h}.${DOMAIN} -> ${resolved} (erwartet ${NODE_IP})"; dns_ok=false
+    warn "  ${h}.${DOMAIN} loest nicht auf"
+    dns_missing=true
   else
     echo "  ${h}.${DOMAIN} -> ${resolved}"
+    seen["$resolved"]=1
   fi
 done
-if ! $dns_ok; then
+
+dns_ok=true
+if $dns_missing; then
+  dns_ok=false
+elif (( ${#seen[@]} > 1 )); then
+  warn "Die Namen zeigen auf verschiedene Adressen: ${!seen[*]}"
+  warn "Fuer die HTTP-01-Challenge muessen alle auf dieselbe Adresse zeigen."
+  dns_ok=false
+else
+  TARGET_ADDR="${!seen[*]}"
+  if [[ "$TARGET_ADDR" == "$NODE_IP" ]]; then
+    echo "  Betriebsart: direkt (Namen zeigen auf die Node-IP)"
+  elif [[ -n "$PUBLIC_IP" && "$TARGET_ADDR" == "$PUBLIC_IP" ]]; then
+    echo "  Betriebsart: NAT ueber ${PUBLIC_IP} -> ${NODE_IP}, wie konfiguriert"
+  elif [[ -n "$PUBLIC_IP" ]]; then
+    warn "  Namen zeigen auf ${TARGET_ADDR}, in der deploy.env steht aber PUBLIC_IP=${PUBLIC_IP}"
+    dns_ok=false
+  else
+    echo "  Betriebsart: NAT vermutet - ${TARGET_ADDR} bildet auf ${NODE_IP} ab"
+    echo "  Fuer eine eindeutige Pruefung PUBLIC_IP=${TARGET_ADDR} in ${ENV_FILE} eintragen."
+  fi
+fi
+
+if $dns_ok; then
+  # Der Test laeuft von der VM aus und damit ueber Hairpin-NAT, das viele
+  # Firewalls nicht beherrschen. Ein Fehlschlag sagt hier also wenig - deshalb
+  # nur als Hinweis, nie als Abbruchgrund.
+  if [[ -n "${TARGET_ADDR:-}" && "$TARGET_ADDR" != "$NODE_IP" ]]; then
+    if curl -sS -o /dev/null --max-time 10 "http://${TARGET_ADDR}/.well-known/acme-challenge/probe" 2>/dev/null; then
+      echo "  Port 80 auf ${TARGET_ADDR} antwortet"
+    else
+      echo "  Port 80 auf ${TARGET_ADDR} von hier nicht pruefbar (Hairpin-NAT)."
+      echo "  Von ausserhalb des Netzes testen:"
+      echo "    curl -I --max-time 10 http://${TARGET_ADDR}/.well-known/acme-challenge/test"
+      echo "  Ein 404 vom nginx ist die gute Antwort; ein Timeout heisst, dass"
+      echo "  Let's Encrypt nicht validieren kann."
+    fi
+  fi
+else
   warn "Solange DNS nicht stimmt, scheitert die HTTP-01-Challenge. Mit LETSENCRYPT_STAGING=true testen."
   read -r -p "Trotzdem fortfahren? [ja/NEIN] " a; [[ "$a" == "ja" ]] || exit 1
 fi

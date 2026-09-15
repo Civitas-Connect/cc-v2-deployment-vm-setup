@@ -395,6 +395,24 @@ else
     else
       wait_ready || warn "Node meldet nach 5 Minuten kein Ready - kubectl describe node"
 
+      # Pods aus dem Snapshot: ihre Container-Namen sind in containerd noch von
+      # der alten Instanz reserviert, das Kubelet bleibt in CreateContainerError
+      # haengen. Normalerweise erledigt das civitas-clusterfix.service beim
+      # ersten Boot; auf aelteren Images gibt es den Dienst nicht.
+      broken=0
+      for sns in kube-system cert-manager ingress-nginx; do
+        while read -r pod phase pready; do
+          [[ -n "$pod" ]] || continue
+          if [[ "$phase" != "Running" || "$pready" != "true" ]]; then
+            echo "  ${sns}/${pod} neu erzeugen (${phase}, ready=${pready})"
+            "$KUBECTL" -n "$sns" delete pod "$pod" --wait=false >/dev/null 2>&1 && broken=$((broken+1))
+          fi
+        done < <("$KUBECTL" -n "$sns" get pods --no-headers \
+                   -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[0].ready \
+                   2>/dev/null || true)
+      done
+      (( broken > 0 )) && ok "${broken} Pod(s) neu erzeugt" || ok "alle System-Pods laufen"
+
       node_ip=$("$KUBECTL" get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
       if [[ "$node_ip" != "$CURRENT_IP" ]]; then
         warn "Node-InternalIP steht auf ${node_ip:-?}, erwartet ${CURRENT_IP}. Node-Objekt wird neu registriert."

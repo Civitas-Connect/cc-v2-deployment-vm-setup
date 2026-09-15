@@ -113,6 +113,8 @@ sudo chmod 600 /etc/civitas/deploy.env
 ```
 
 Pflichtfelder: `DOMAIN`, `INSTANCE_SLUG`, `INITIAL_USER_EMAIL`, `LETSENCRYPT_EMAIL`.
+Steht die Instanz hinter NAT, kann `PUBLIC_IP` gesetzt werden — nötig ist es nicht, das
+Skript erkennt die NAT-Situation auch selbst.
 Dazu SMTP, falls Keycloak Mails verschicken soll. Bei einer neuen Domain
 `LETSENCRYPT_STAGING=true` lassen — die Produktions-CA sperrt nach fünf fehlgeschlagenen
 Validierungen pro Stunde.
@@ -186,6 +188,8 @@ DHCP-Fallback entstehen erst beim Lauf von `10-build-template.sh`.
 | `certificate is not yet valid` | Uhr ging beim Boot falsch → `k3s certificate rotate` bei gestopptem Dienst |
 | `permission denied` bei kubectl | nach dem Build einmal neu anmelden (Gruppe `civitas`) |
 | `no matches for path: ../helmfile-root…` | veraltete Skriptfassung, `DEPLOY_DIR` muss `${REPO_COPY}/deployment` sein |
+| Pods in `CreateContainerError`, `name ... is reserved for` | Container-Namen aus dem Snapshot → `kubectl -n <ns> delete pod --all`; `civitas-clusterfix` macht das beim ersten Boot automatisch |
+| DNS-Warnung „erwartet 192.168.x.y" bei NAT | behoben — bei einheitlicher öffentlicher Adresse ist das kein Fehler mehr; optional `PUBLIC_IP` setzen |
 | `no endpoints available for service cert-manager-webhook` | zu früh gestartet, cert-manager war noch nicht bereit → einfach erneut laufen lassen |
 | CoreDNS in CrashLoopBackOff | Schlüssel in `coredns-custom` muss `.server` heißen, nicht `.override` |
 | NiFi `SunCertPathBuilderException` | Truststore passt nicht zur ACME-Umgebung |

@@ -59,6 +59,9 @@ done
 systemctl is-enabled civitas-firstboot.service >/dev/null 2>&1 \
   || die "civitas-firstboot.service ist nicht aktiviert. Ohne den Dienst waeren alle Klone identisch."
 
+systemctl is-enabled civitas-clusterfix.service >/dev/null 2>&1 \
+  || warn "civitas-clusterfix.service ist nicht aktiviert. Klone koennen dann Pods in CreateContainerError haben (Container-Namen aus dem Snapshot). 10-build-template.sh erneut laufen lassen."
+
 [[ -f /etc/netplan/01-civitas-dhcp.yaml ]] \
   || warn "Kein DHCP-Fallback unter /etc/netplan/01-civitas-dhcp.yaml. Klone kommen dann nur ueber die Konsole ans Netz."
 

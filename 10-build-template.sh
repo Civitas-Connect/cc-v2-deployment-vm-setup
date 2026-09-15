@@ -10,6 +10,8 @@
 #   - civitas-core-deployment-Repo auf festem Tag + optionales Vorziehen aller Images
 #   - civitas-firstboot.service: erzeugt in jedem Klon beim ersten Boot eine
 #     frische Maschinenidentitaet (machine-id, SSH-Host-Keys, k3s-Serverzertifikat)
+#   - civitas-clusterfix.service: erzeugt danach die Pods neu, deren
+#     Container-Namen aus dem Snapshot noch in containerd reserviert sind
 #   - DHCP-Fallback im Netz, damit ein Klon ohne Konsolenzugriff online kommt
 #
 # Es wird bewusst KEIN ClusterIssuer, KEIN Namespace und KEIN CIVITAS-Deployment angelegt.
@@ -372,6 +374,13 @@ cat >/etc/issue <<'ISSUE'
 
 ISSUE
 
+# Beim naechsten Boot raeumt civitas-clusterfix die Pods auf, die aus dem
+# Snapshot stammen. Ihre Container-Namen sind in containerd noch von der alten
+# Instanz reserviert, das Kubelet scheitert sonst endlos mit
+#   failed to reserve container name ... is reserved for <container-id>
+# und der Pod bleibt in CreateContainerError haengen.
+touch /etc/civitas/clusterfix-pending
+
 rm -f "$SEAL"
 say "fertig, Neustart"
 systemctl reboot
@@ -399,9 +408,87 @@ StandardError=journal+console
 [Install]
 WantedBy=sysinit.target
 EOF
+  cat >/usr/local/sbin/civitas-clusterfix.sh <<'EOF'
+#!/usr/bin/env bash
+#
+# Laeuft einmalig beim ersten Boot eines Klons, nachdem civitas-firstboot die
+# Identitaet erneuert hat und k3s wieder gestartet ist.
+#
+# Aufgabe: Pods entfernen, die aus dem Snapshot stammen. Der Sysprep stoppt
+# k3s, aber die containerd-Metadaten der damals laufenden Container wandern mit
+# ins Image. Im Klon kollidiert dann das alte Pod-Objekt mit der noch
+# reservierten Container-Namensvergabe, und das Kubelet versucht endlos:
+#   Error: failed to reserve container name "..."; check if another
+#   CreateContainer request is in progress: name "..." is reserved for "..."
+# Ein Loeschen des Pods erzeugt eine neue UID und damit einen neuen Namen.
+#
+set -uo pipefail
+
+MARKER=/etc/civitas/clusterfix-pending
+[[ -e "$MARKER" ]] || exit 0
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+KUBECTL=/usr/local/bin/kubectl
+say() { echo "civitas-clusterfix: $*" >&2; }
+
+# Auf die API warten - beim ersten Boot dauert der Start laenger als sonst.
+ready=false
+for _ in $(seq 1 120); do
+  "$KUBECTL" get --raw=/readyz >/dev/null 2>&1 && { ready=true; break; }
+  sleep 5
+done
+if ! $ready; then
+  say "k3s-API nach 10 Minuten nicht erreichbar, Marke bleibt fuer den naechsten Boot"
+  exit 0
+fi
+
+# Den Pods eine faire Chance geben, von selbst hochzukommen.
+sleep 60
+
+fixed=0
+for ns in kube-system cert-manager ingress-nginx; do
+  while read -r pod phase ready_state; do
+    [[ -n "$pod" ]] || continue
+    # Alles anfassen, was nicht laeuft oder nicht bereit ist. Laufende,
+    # gesunde Pods bleiben unberuehrt - ein pauschales Loeschen waere
+    # unnoetig teuer.
+    if [[ "$phase" != "Running" || "$ready_state" != "true" ]]; then
+      say "loesche ${ns}/${pod} (${phase}, ready=${ready_state})"
+      "$KUBECTL" -n "$ns" delete pod "$pod" --wait=false >/dev/null 2>&1 && fixed=$((fixed+1))
+    fi
+  done < <("$KUBECTL" -n "$ns" get pods --no-headers              -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[0].ready              2>/dev/null || true)
+done
+
+say "${fixed} Pod(s) neu erzeugt"
+rm -f "$MARKER"
+EOF
+  chmod 0755 /usr/local/sbin/civitas-clusterfix.sh
+
+  cat >/etc/systemd/system/civitas-clusterfix.service <<'EOF'
+[Unit]
+Description=CIVITAS: Pods aus dem Snapshot nach dem Klonen neu erzeugen
+Documentation=file:///usr/local/sbin/civitas-clusterfix.sh
+ConditionPathExists=/etc/civitas/clusterfix-pending
+After=k3s.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/civitas-clusterfix.sh
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
   systemctl daemon-reload
   systemctl enable civitas-firstboot.service >/dev/null
+  systemctl enable civitas-clusterfix.service >/dev/null
   echo "  civitas-firstboot.service aktiviert (greift nur bei /etc/civitas/sealed)"
+  echo "  civitas-clusterfix.service aktiviert (greift beim ersten Boot danach)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -668,6 +755,17 @@ LETSENCRYPT_STAGING=true
 # etwa bei mehreren Interfaces. Weicht der Wert von der tatsaechlichen Adresse
 # ab, bricht 30-deploy-civitas.sh mit einem Hinweis auf 25-postclone-setup.sh ab.
 NODE_IP=
+
+# Oeffentliche Adresse, auf die die DNS-Namen zeigen, wenn die Instanz hinter
+# NAT steht - also die Adresse, unter der Let's Encrypt die Instanz erreicht.
+#
+# Leer lassen ist erlaubt: zeigen alle vier Namen einheitlich auf dieselbe
+# Adresse, die nicht die Node-IP ist, erkennt das Skript die NAT-Situation und
+# akzeptiert sie. Eintragen macht die Pruefung nur eindeutiger - dann faellt
+# auch auf, wenn ein Record versehentlich auf die falsche Instanz zeigt.
+#
+# Beispiel: PUBLIC_IP=93.88.227.82
+PUBLIC_IP=
 
 # Zusaetzliche Hostnamen fuer den Split-Horizon, ohne Domain-Suffix, durch
 # Leerzeichen getrennt. Die vier Kern-Hosts (api, idm, portal, dashboard) sind
