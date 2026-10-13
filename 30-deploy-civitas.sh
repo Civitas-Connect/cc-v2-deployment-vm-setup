@@ -111,7 +111,10 @@ Erst korrigieren: sudo ./25-postclone-setup.sh --check
 Danach: sudo ./25-postclone-setup.sh --hostname \$(hostname) --ip ${HOST_IP}/<praefix> --gateway <gw> --dns <dns>"
 fi
 
-CORE_HOSTS=(api idm portal dashboard)
+# management ist seit v2.0.0 dabei (Portal-Backend-API). Alle Namen landen im
+# selben Zertifikat apisix-tls - fehlt einer im DNS, scheitert die Challenge
+# fuer das ganze Zertifikat.
+CORE_HOSTS=(api idm portal dashboard management)
 for h in $EXTRA_HOSTS; do CORE_HOSTS+=("$h"); done
 
 log "Konfiguration"
@@ -539,6 +542,7 @@ global:
   ingress:
     clusterIssuer: 'letsencrypt-prod'
     ingressClass: 'nginx'
+    controller: 'nginx'
 EOF
 echo "  global.yaml.gotmpl geschrieben"
 
@@ -606,7 +610,7 @@ if (( ${#ing_hosts[@]} > 0 )); then
   apply_coredns_hosts "${ing_hosts[@]}"
   printf '  %s\n' "${ing_hosts[@]}"
 else
-  warn "Keine Ingress-Hosts gefunden - es bleiben die vier Standardnamen."
+  warn "Keine Ingress-Hosts gefunden - es bleiben die Standardnamen."
 fi
 
 # ---------------------------------------------------------------------------
@@ -653,6 +657,7 @@ Deployment abgeschlossen.
   Keycloak   https://idm.${DOMAIN}      (Realm ${INSTANCE_SLUG})
   API        https://api.${DOMAIN}      (Routen unter /v1)
   Dashboards https://dashboard.${DOMAIN}
+  Mgmt-API   https://management.${DOMAIN}  (Routen unter /v1)
 
   Keycloak-Admin-Passwort: ${KC_PW:-<Secret keycloak-admin-user noch nicht vorhanden>}
 

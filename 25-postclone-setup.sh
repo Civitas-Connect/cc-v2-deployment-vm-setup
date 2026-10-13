@@ -502,6 +502,6 @@ Weiter mit:
   sudo nano /etc/civitas/deploy.env
   sudo bash 30-deploy-civitas.sh
 
-DNS-A-Records auf ${CURRENT_IP} zeigen lassen: api, idm, portal, dashboard
+DNS-A-Records auf ${CURRENT_IP} zeigen lassen: api, idm, portal, dashboard, management
 ------------------------------------------------------------------
 EOF

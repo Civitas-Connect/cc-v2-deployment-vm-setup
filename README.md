@@ -27,7 +27,7 @@ alles auf latest hoch:
 ```bash
 cat /etc/civitas/template.env
 sudo K3S_VERSION="v1.36.3+k3s1" CERT_MANAGER_VERSION="v1.21.1" \
-     HELMFILE_VERSION="1.7.2" CIVITAS_TAG="v2.0-rc2" PREPULL_IMAGES=false \
+     HELMFILE_VERSION="1.7.2" CIVITAS_TAG="v2.0.0" PREPULL_IMAGES=false \
      bash /opt/civitas/scripts/10-build-template.sh
 ```
 

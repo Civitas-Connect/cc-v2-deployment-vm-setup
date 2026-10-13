@@ -46,7 +46,7 @@ SVC_CIDR="10.43.0.0/16"
 
 # CIVITAS-Deployment-Repo
 CIVITAS_REPO="${CIVITAS_REPO:-https://gitlab.com/civitas-connect/civitas-core/civitas-core-v2/civitas-core-deployment.git}"
-CIVITAS_TAG="${CIVITAS_TAG:-v2.0-rc2}"
+CIVITAS_TAG="${CIVITAS_TAG:-v2.0.0}"
 CIVITAS_DIR="/opt/civitas/civitas-core-deployment"
 
 # Images des CIVITAS-Stacks schon im Template vorziehen. Groesster Zeitgewinn
@@ -709,7 +709,7 @@ if ! $ADDONS_ONLY; then
 # -----------------------------------------------------------------------------
 
 # Basis-Domain der Instanz. Darunter muessen mindestens diese A-Records auf die
-# Node-IP zeigen:  api, idm, portal, dashboard
+# Node-IP zeigen:  api, idm, portal, dashboard, management
 # 30-deploy-civitas.sh prueft das vorab per getent und warnt bei Abweichungen.
 DOMAIN=demo.civitascore.de
 
@@ -759,7 +759,7 @@ NODE_IP=
 # Oeffentliche Adresse, auf die die DNS-Namen zeigen, wenn die Instanz hinter
 # NAT steht - also die Adresse, unter der Let's Encrypt die Instanz erreicht.
 #
-# Leer lassen ist erlaubt: zeigen alle vier Namen einheitlich auf dieselbe
+# Leer lassen ist erlaubt: zeigen alle Namen einheitlich auf dieselbe
 # Adresse, die nicht die Node-IP ist, erkennt das Skript die NAT-Situation und
 # akzeptiert sie. Eintragen macht die Pruefung nur eindeutiger - dann faellt
 # auch auf, wenn ein Record versehentlich auf die falsche Instanz zeigt.
@@ -768,7 +768,7 @@ NODE_IP=
 PUBLIC_IP=
 
 # Zusaetzliche Hostnamen fuer den Split-Horizon, ohne Domain-Suffix, durch
-# Leerzeichen getrennt. Die vier Kern-Hosts (api, idm, portal, dashboard) sind
+# Leerzeichen getrennt. Die Kern-Hosts (api, idm, portal, dashboard, management) sind
 # immer dabei und muessen hier nicht stehen.
 # Beispiel fuer eine Instanz mit eigenem NiFi- und MinIO-Ingress:
 #   EXTRA_HOSTS="nifi s3"
@@ -799,7 +799,7 @@ SMTP_PASSWORD=
 # Tag oder Branch, von dem deployt wird.
 #
 # Leer oder auskommentiert = der Stand, der im Image ausgecheckt ist
-# (bei diesem Template v2.0-rc2). Das ist der Normalfall und der schnellste
+# (bei diesem Template v2.0.0). Das ist der Normalfall und der schnellste
 # Weg, weil die Container-Images dazu bereits im Node liegen.
 #
 # Ein abweichender Wert schaltet NUR die Arbeitskopie unter
@@ -808,7 +808,7 @@ SMTP_PASSWORD=
 # geholt - dafuer braucht die VM Netzzugang zum GitLab.
 #
 # Beispiele:
-#   CIVITAS_REF=v2.0-rc3     # anderer Tag
+#   CIVITAS_REF=v2.0-rc2     # anderer Tag
 #   CIVITAS_REF=main         # Branch, wird auf origin/main aufgeloest
 #   CIVITAS_REF=a1b2c3d      # einzelner Commit
 #
@@ -843,6 +843,7 @@ global:
   ingress:
     clusterIssuer: 'letsencrypt-prod'
     ingressClass: 'nginx'
+    controller: 'nginx'
 EOF
       images=$(helmfile -f "${render}/deployment/helmfile.yaml" template -e production 2>/dev/null \
         | grep -Ei '^[[:space:]]*image:[[:space:]]' \
