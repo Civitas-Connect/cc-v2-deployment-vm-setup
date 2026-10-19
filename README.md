@@ -16,6 +16,17 @@ aufgerufen, nie mit `sh` — `sh` ist dash und kennt `[[ ]]` nicht.
 
 ## A – Golden Image erzeugen (Master)
 
+Leere Ubuntu-24.04-VM mit sudo-Benutzer und hinterlegtem SSH-Key. Skripte holen:
+
+```bash
+sudo git clone https://github.com/BronxHD/civitas-core-demo_clone_setup-.git /opt/civitas/scripts-src
+sudo install -d -m 0755 /opt/civitas/scripts
+sudo install -m 0755 /opt/civitas/scripts-src/*.sh /opt/civitas/scripts/
+sudo install -m 0644 /opt/civitas/scripts-src/deploy.env.example /opt/civitas/scripts/
+```
+
+Image bauen:
+
 ```bash
 tmux new -s build
 sudo bash /opt/civitas/scripts/10-build-template.sh
@@ -95,6 +106,10 @@ Gleich sein dürfen: Node-Name `civitas-node`, Cluster-CA, Pod-CIDR, Image-Store
 *.demo2.ghost-website.de   A   93.88.227.78   (TTL 300)
 ```
 
+Ohne Wildcard braucht jeder Hostname des Releases einen eigenen Record (v2.0.0: api, idm,
+portal, dashboard, management). Das Deploy-Skript liest die Liste aus dem gerenderten
+Release, gibt sie aus und prüft jeden Namen, bevor es etwas am Cluster ändert.
+
 **2. Erreichbarkeit von außen prüfen** — vom Handy-Hotspot, nicht aus dem Firmennetz:
 
 ```bash
@@ -122,6 +137,9 @@ Validierungen pro Stunde.
 Optional `CIVITAS_REF`, um von einem anderen Tag oder Branch zu deployen. Leer heißt:
 der Stand aus dem Image.
 
+`SCRIPTS_REF=main` (Standard in der Vorlage) holt vor jedem Lauf die aktuellen Skripte aus
+GitHub. Leer schaltet das ab, `--no-update` überspringt es einmalig.
+
 **4. Ausrollen.** In tmux, der Lauf dauert etliche Minuten ohne viel Ausgabe:
 
 ```bash
@@ -129,9 +147,11 @@ tmux new -s deploy
 sudo bash /opt/civitas/scripts/30-deploy-civitas.sh
 ```
 
-Das Skript legt ClusterIssuer, CoreDNS-Split-Horizon, Namespace und Secrets an und rollt
-dann in zwei Schritten aus: erst `helmfile-operators.yaml`, nach dem Bereitwerden der
-Webhooks `helmfile-instance.yaml.gotmpl`.
+Das Skript aktualisiert sich zuerst selbst (`SCRIPTS_REF`) und rendert dann das Release
+als Vorabprüfung. Scheitert das, bricht es ab, bevor am Cluster etwas passiert. Danach
+legt es ClusterIssuer, CoreDNS-Split-Horizon, Namespace und Secrets an und rollt in zwei
+Schritten aus: erst `helmfile-operators.yaml`, nach dem Bereitwerden der Webhooks
+`helmfile-instance.yaml.gotmpl`.
 
 **5. Prüfen.**
 
@@ -158,9 +178,24 @@ baut sie neu auf.
 
 ---
 
+## Neue CIVITAS-Version
+
+Kein neues Image nötig. Auf dem Klon in `/etc/civitas/deploy.env` setzen:
+
+```bash
+CIVITAS_REF=v2.1.0
+```
+
+und `30-deploy-civitas.sh` laufen lassen (vorher gern mit `--diff`). Mussten die Skripte
+für das Release angepasst werden, reicht ein Push nach GitHub: jeder Klon holt sie über
+`SCRIPTS_REF` beim nächsten Lauf. Ein neues Image lohnt sich nur, damit die Images der neuen
+Version schon vorgeladen sind, oder weil k3s-Zertifikate bzw. OS-Updates es ohnehin fällig
+machen.
+
 ## Skripte auf einer laufenden VM aktualisieren
 
-Nur nötig, solange der Snapshot älter ist als die Skripte:
+Mit `SCRIPTS_REF` in der `deploy.env` passiert das automatisch. Für ältere Klone ohne diese
+Variable einmalig von Hand:
 
 ```bash
 sudo chmod 0755 /opt/civitas/scripts/*.sh

@@ -502,6 +502,7 @@ Weiter mit:
   sudo nano /etc/civitas/deploy.env
   sudo bash 30-deploy-civitas.sh
 
-DNS-A-Records auf ${CURRENT_IP} zeigen lassen: api, idm, portal, dashboard, management
+DNS: am einfachsten *.<domain> auf ${CURRENT_IP} (bzw. die NAT-Adresse). 30-deploy-civitas.sh
+nennt die genauen Hostnamen des Releases und prueft sie vorab.
 ------------------------------------------------------------------
 EOF

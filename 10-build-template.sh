@@ -708,9 +708,10 @@ if ! $ADDONS_ONLY; then
 # Pflicht
 # -----------------------------------------------------------------------------
 
-# Basis-Domain der Instanz. Darunter muessen mindestens diese A-Records auf die
-# Node-IP zeigen:  api, idm, portal, dashboard, management
-# 30-deploy-civitas.sh prueft das vorab per getent und warnt bei Abweichungen.
+# Basis-Domain der Instanz. Am einfachsten ein Wildcard-Record *.<DOMAIN>.
+# Welche Namen genau gebraucht werden, haengt vom Release ab (v2.0.0: api, idm,
+# portal, dashboard, management). 30-deploy-civitas.sh liest die Liste aus dem
+# gerenderten Release und prueft jeden Namen vorab per getent.
 DOMAIN=demo.civitascore.de
 
 # Kurzname der Instanz. Wird gleichzeitig als Kubernetes-Namespace und als
@@ -768,8 +769,8 @@ NODE_IP=
 PUBLIC_IP=
 
 # Zusaetzliche Hostnamen fuer den Split-Horizon, ohne Domain-Suffix, durch
-# Leerzeichen getrennt. Die Kern-Hosts (api, idm, portal, dashboard, management) sind
-# immer dabei und muessen hier nicht stehen.
+# Leerzeichen getrennt. Die Hosts aus dem Release werden automatisch ermittelt
+# und muessen hier nicht stehen.
 # Beispiel fuer eine Instanz mit eigenem NiFi- und MinIO-Ingress:
 #   EXTRA_HOSTS="nifi s3"
 EXTRA_HOSTS=""
@@ -819,6 +820,19 @@ SMTP_PASSWORD=
 # Pfad zum ausgecheckten civitas-core-deployment-Repo. Nur aendern, wenn im
 # Template ein abweichender Ort verwendet wurde.
 #CIVITAS_DIR=/opt/civitas/civitas-core-deployment
+
+# Skripte vor jedem Deploy aus Git aktualisieren. 30-deploy-civitas.sh holt
+# SCRIPTS_REF aus SCRIPTS_REPO, legt die Skripte nach /opt/civitas/scripts und
+# startet sich mit der neuen Fassung neu. So kommen Anpassungen an neue
+# CIVITAS-Releases auf bestehende Klone, ohne das Image neu zu bauen.
+#
+# Leer = aus, es laeuft die Fassung aus dem Image. Einmalig abschalten:
+#   sudo bash /opt/civitas/scripts/30-deploy-civitas.sh --no-update
+#
+# Das Repo muss ohne Anmeldung erreichbar sein. Die Skripte laufen als root -
+# wer sicher gehen will, setzt hier einen Tag statt eines Branches.
+SCRIPTS_REF=main
+#SCRIPTS_REPO=https://github.com/BronxHD/civitas-core-demo_clone_setup-.git
 CIVITASENV
   chmod 0644 /etc/civitas/deploy.env.example
 
