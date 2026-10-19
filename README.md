@@ -24,6 +24,7 @@ in the image, so a deployment takes minutes instead of hours.
 | `20-sysprep-template.sh` | master, before every snapshot | Seals the image: stops k3s, removes credentials and logs, sets the first-boot marker |
 | `25-postclone-setup.sh` | each clone | Sets hostname and static IP, moves k3s to the new IP |
 | `30-deploy-civitas.sh` | each clone | ClusterIssuer, CoreDNS split horizon, secrets, `helmfile` rollout |
+| `40-verify-civitas.sh` | each clone, any time | Read-only health check of the instance (node, services, releases, pods, certificates, DNS, TLS) |
 
 On the first boot of a clone, `civitas-firstboot.service` automatically generates a new
 `machine-id` and new SSH host keys, then reboots once. Nothing domain- or IP-specific is
@@ -95,6 +96,14 @@ again afterwards to use `kubectl` without `sudo`.
 4. **Switch to production certificates** once everything works on staging: set
    `LETSENCRYPT_STAGING=false` and run the script again. Old staging certificates are
    replaced automatically.
+5. **Verify** the instance (changes nothing, safe to run at any time):
+   ```bash
+   sudo bash /opt/civitas/scripts/40-verify-civitas.sh      # --quiet: only problems
+   ```
+   Checks everything from node and k3s certificates through cert-manager, operators, Helm
+   releases, pods and PVCs to DNS and a TLS handshake per host, and prints a fix hint for each
+   problem. Exit code `0` = all good, `1` = warnings, `2` = errors, so it also works for
+   monitoring.
 
 Other options: `--diff` (preview only), `--reset` (wipe and rebuild the instance),
 `--prepare` (only issuer/DNS/secrets), `--no-update` (skip the script self-update).
