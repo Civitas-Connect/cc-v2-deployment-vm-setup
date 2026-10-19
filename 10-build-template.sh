@@ -2,69 +2,69 @@
 #
 # 10-build-template.sh
 #
-# Baut aus einer leeren Ubuntu-24.04-VM eine geklont-fähige CIVITAS/CORE-V2-Basis:
-#   - Härtung (unattended-upgrades, SSH, ufw, fail2ban)
-#   - k3s als Single-Node-Cluster mit FESTEM Node-Namen (überlebt Hostname-/IP-Wechsel)
-#   - ingress-nginx (DaemonSet + hostNetwork) und cert-manager
-#   - Tooling (helm, helmfile, helm-diff, k9s, jq, git)
-#   - civitas-core-deployment-Repo auf festem Tag + optionales Vorziehen aller Images
-#   - civitas-firstboot.service: erzeugt in jedem Klon beim ersten Boot eine
-#     frische Maschinenidentitaet (machine-id, SSH-Host-Keys, k3s-Serverzertifikat)
-#   - civitas-clusterfix.service: erzeugt danach die Pods neu, deren
-#     Container-Namen aus dem Snapshot noch in containerd reserviert sind
-#   - DHCP-Fallback im Netz, damit ein Klon ohne Konsolenzugriff online kommt
+# Turns an empty Ubuntu 24.04 VM into a clonable CIVITAS/CORE V2 base:
+#   - hardening (unattended-upgrades, SSH, ufw, fail2ban)
+#   - k3s as single-node cluster with a FIXED node name (survives hostname/IP changes)
+#   - ingress-nginx (DaemonSet + hostNetwork) and cert-manager
+#   - tooling (helm, helmfile, helm-diff, k9s, jq, git)
+#   - civitas-core-deployment repo on a fixed tag + optional pre-pull of all images
+#   - civitas-firstboot.service: on first boot, gives every clone a fresh
+#     machine identity (machine-id, SSH host keys, k3s server certificate)
+#   - civitas-clusterfix.service: afterwards recreates the pods whose
+#     container names from the snapshot are still reserved in containerd
+#   - DHCP fallback so a clone comes online without console access
 #
-# Es wird bewusst KEIN ClusterIssuer, KEIN Namespace und KEIN CIVITAS-Deployment angelegt.
-# Alles Domain- und IP-abhängige passiert erst in 30-deploy-civitas.sh nach dem Klonen.
+# Deliberately creates NO ClusterIssuer, NO namespace and NO CIVITAS deployment.
+# Everything domain- and IP-specific happens later in 30-deploy-civitas.sh after cloning.
 #
-# Aufruf:
-#   sudo ./10-build-template.sh                 # kompletter Build
-#   sudo ./10-build-template.sh --addons-only   # nur ingress-nginx + cert-manager + StorageClasses
-#                                               # (nach einem Sysprep mit --reset-cluster)
+# Usage:
+#   sudo ./10-build-template.sh                 # full build
+#   sudo ./10-build-template.sh --addons-only   # only ingress-nginx + cert-manager + StorageClasses
+#                                               # (after a sysprep with --reset-cluster)
 #
 
 
 # ---------------------------------------------------------------------------
-# Konfiguration
+# Configuration
 # ---------------------------------------------------------------------------
 
-# Leer lassen = aktueller stable-Channel. Fuer reproduzierbare Images nach dem
-# ersten Build die in /etc/civitas/template.env protokollierte Version eintragen.
-K3S_VERSION="${K3S_VERSION:-}"                     # z.B. "v1.33.4+k3s1"
-CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-}"   # z.B. "v1.17.2", leer = latest
-INGRESS_NGINX_CHART_VERSION="${INGRESS_NGINX_CHART_VERSION:-}"  # z.B. "4.12.1", leer = latest
+# Empty = current stable channel. For reproducible images, enter the version
+# logged in /etc/civitas/template.env after the first build.
+K3S_VERSION="${K3S_VERSION:-}"                     # e.g. "v1.33.4+k3s1"
+CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-}"   # e.g. "v1.17.2", empty = latest
+INGRESS_NGINX_CHART_VERSION="${INGRESS_NGINX_CHART_VERSION:-}"  # e.g. "4.12.1", empty = latest
 HELMFILE_VERSION="${HELMFILE_VERSION:-1.7.2}"
 
-# Fester Node-Name: entkoppelt die Cluster-Identitaet vom Hostnamen.
-# Ohne das registriert sich jeder Klon als neuer Node und der alte bleibt als
-# NotReady im Datastore liegen.
+# Fixed node name: decouples the cluster identity from the hostname.
+# Without it every clone registers as a new node and the old one stays
+# in the datastore as NotReady.
 NODE_NAME="${NODE_NAME:-civitas-node}"
 
-# Pod-/Service-CIDR von k3s (Defaults). Muessen in der Firewall freigegeben werden.
+# Pod/service CIDR of k3s (defaults). Must be allowed in the firewall.
 POD_CIDR="10.42.0.0/16"
 SVC_CIDR="10.43.0.0/16"
 
-# CIVITAS-Deployment-Repo
+# CIVITAS deployment repo
 CIVITAS_REPO="${CIVITAS_REPO:-https://gitlab.com/civitas-connect/civitas-core/civitas-core-v2/civitas-core-deployment.git}"
 CIVITAS_TAG="${CIVITAS_TAG:-v2.0.0}"
 CIVITAS_DIR="/opt/civitas/civitas-core-deployment"
 
-# Images des CIVITAS-Stacks schon im Template vorziehen. Groesster Zeitgewinn
-# nach dem Klonen, macht das Deployment unabhaengig von Registry-Rate-Limits.
+# Pre-pull the CIVITAS stack images into the template. Biggest time saver
+# after cloning, and makes the deployment independent of registry rate limits.
 PREPULL_IMAGES="${PREPULL_IMAGES:-true}"
 
-# Optional: kubectl-Zugriff von aussen auf Port 6443 fuer genau eine IP.
-# Leer lassen = 6443 bleibt komplett zu (empfohlen).
+# Optional: external kubectl access on port 6443 for exactly one IP.
+# Leave empty = 6443 stays fully closed (recommended).
 API_ALLOW_FROM="${API_ALLOW_FROM:-}"
 
-# SSH-Port (falls abweichend, hier UND in der Hoster-Firewall anpassen)
+# SSH port (if different, change it here AND in the hoster firewall)
 SSH_PORT="${SSH_PORT:-22}"
 
 ADDONS_ONLY=false
 [[ "${1:-}" == "--addons-only" ]] && ADDONS_ONLY=true
 
 # ---------------------------------------------------------------------------
-# Helfer
+# Helpers
 # ---------------------------------------------------------------------------
 
 log()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -107,12 +107,12 @@ if ! $ADDONS_ONLY; then
 fi
 
 # ---------------------------------------------------------------------------
-# 1 – Grundsystem
+# 1 – Base system
 # ---------------------------------------------------------------------------
 
 if ! $ADDONS_ONLY; then
-  # apt-get upgrade laeuft je nach Update-Rueckstand viele Minuten ohne Ausgabe.
-# Reisst dabei die SSH-Sitzung ab, bleibt dpkg auf halbem Weg stehen.
+  # Depending on the update backlog, apt-get upgrade runs for many minutes without output.
+# If the SSH session drops meanwhile, dpkg is left half-way.
 if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
   warn "Der Lauf haengt an dieser SSH-Sitzung. Reisst sie ab, bleibt dpkg auf halbem Weg stehen."
   warn "Empfehlung: abbrechen und in 'tmux' oder 'screen' erneut starten."
@@ -161,7 +161,7 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 2 – Haertung (wandert vollstaendig ins Image, der Klon muss nichts mehr tun)
+# 2 – Hardening (goes entirely into the image, the clone has nothing left to do)
 # ---------------------------------------------------------------------------
 
 if ! $ADDONS_ONLY; then
@@ -182,8 +182,8 @@ EOF
   systemctl enable --now unattended-upgrades
 
   log "SSH haerten"
-  # Praefix 00-: in sshd gewinnt der zuerst gelesene Wert. cloud-init schreibt
-  # 50-cloud-init.conf mit PasswordAuthentication yes - das wuerde sonst gewinnen.
+  # Prefix 00-: in sshd the first value read wins. cloud-init writes
+  # 50-cloud-init.conf with PasswordAuthentication yes - that would win otherwise.
   cat >/etc/ssh/sshd_config.d/00-civitas-hardening.conf <<EOF
 Port ${SSH_PORT}
 PasswordAuthentication no
@@ -197,11 +197,11 @@ LoginGraceTime 30
 ClientAliveInterval 300
 ClientAliveCountMax 2
 EOF
-  # /run liegt auf tmpfs und ist nach jedem Boot leer. sshd legt das
-  # Privilege-Separation-Verzeichnis beim Start selbst an - wurde der Dienst
-  # seit dem Boot nie gestartet (nach civitas-firstboot fehlen die Host-Keys,
-  # ohne sie startet sshd nicht), existiert es nicht, und "sshd -t" bricht mit
-  # "Missing privilege separation directory" ab.
+  # /run is a tmpfs and empty after every boot. sshd creates the
+  # privilege separation directory itself on start - if the service has
+  # never started since boot (after civitas-firstboot the host keys are
+  # missing, and sshd won't start without them), it does not exist and
+  # "sshd -t" fails with "Missing privilege separation directory".
   install -d -m 0755 -o root -g root /run/sshd
   ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1 || ssh-keygen -A
 
@@ -214,8 +214,8 @@ EOF
 
   log "Firewall (ufw)"
   apt-get install -y -qq ufw
-  # Pflicht fuer Kubernetes: ufw setzt FORWARD sonst auf DROP und der Pod-Traffic
-  # stirbt. Typisches Symptom: Admission-Webhooks laufen in "context deadline exceeded".
+  # Required for Kubernetes: otherwise ufw sets FORWARD to DROP and pod traffic
+  # dies. Typical symptom: admission webhooks run into "context deadline exceeded".
   sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
   ufw --force reset >/dev/null
   ufw default deny incoming
@@ -257,28 +257,28 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 2b – Klon-Automatik
+# 2b – Clone automation
 #
-# Das Image traegt alles, was ein Klon zum Selbststart braucht:
-#   - DHCP-Fallback, damit jeder Klon ohne Konsole online kommt
-#   - cloud-init schreibt keine Netzwerkkonfiguration mehr (Nutanix AHV liefert
-#     je nach Vorlage eine aus, die sonst mit 25-postclone-setup.sh kollidiert)
-#   - civitas-firstboot.service erzeugt beim ersten Boot eines versiegelten
-#     Images eine frische Maschinenidentitaet und startet danach neu
+# The image carries everything a clone needs to bring itself up:
+#   - DHCP fallback so every clone comes online without a console
+#   - cloud-init no longer writes a network config (depending on the template,
+#     Nutanix AHV ships one that would otherwise clash with 25-postclone-setup.sh)
+#   - civitas-firstboot.service creates a fresh machine identity on the first
+#     boot of a sealed image and then reboots
 #
-# Dadurch muss 20-sysprep-template.sh die Identitaet NICHT mehr loeschen -
-# und genau deshalb darf der Master weiterlaufen und live gesnapshottet werden.
+# Because of this, 20-sysprep-template.sh does NOT need to delete the identity -
+# which is exactly why the master can keep running and be snapshotted live.
 # ---------------------------------------------------------------------------
 
 if ! $ADDONS_ONLY; then
   log "Netz-Fallback fuer Klone (DHCP)"
-  # Niedrige Nummer = verliert gegen die Instanzkonfiguration aus
-  # 25-postclone-setup.sh (10-civitas-instance.yaml) und gegen cloud-init (50-).
-  # Auf der Build-VM aendert sich dadurch nichts, es wird kein netplan apply
-  # ausgefuehrt.
+  # Low number = loses against the instance config from
+  # 25-postclone-setup.sh (10-civitas-instance.yaml) and against cloud-init (50-).
+  # Nothing changes on the build VM, no netplan apply is
+  # executed.
   cat >/etc/netplan/01-civitas-dhcp.yaml <<'EOF'
-# Fallback aus dem CIVITAS-Template. Greift nur, wenn keine Instanz-
-# konfiguration vorhanden ist - also unmittelbar nach dem Klonen.
+# Fallback from the CIVITAS template. Only applies if no instance
+# configuration exists - i.e. right after cloning.
 network:
   version: 2
   ethernets:
@@ -293,8 +293,8 @@ EOF
   netplan generate || warn "netplan generate meldet Fehler - 01-civitas-dhcp.yaml pruefen."
 
   log "Zeitsynchronisation sicherstellen"
-  # Ohne verlaessliche Uhr erzeugt k3s im Klon Zertifikate mit einem NotBefore
-  # in der Zukunft. Zieht NTP die Uhr spaeter zurueck, ist der Cluster tot.
+  # Without a reliable clock, k3s in the clone creates certificates with a NotBefore
+  # in the future. Once NTP moves the clock back, the cluster is dead.
   systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
   timedatectl set-ntp true >/dev/null 2>&1 || true
   if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
@@ -312,14 +312,14 @@ EOF
   cat >/usr/local/sbin/civitas-firstboot.sh <<'EOF'
 #!/usr/bin/env bash
 #
-# Laeuft sehr frueh im Boot, bevor sshd und k3s starten, und nur dann, wenn
-# /etc/civitas/sealed existiert - also beim ersten Boot eines frisch
-# geklonten (oder frisch versiegelten) Images.
+# Runs very early during boot, before sshd and k3s start, and only if
+# /etc/civitas/sealed exists - i.e. on the first boot of a freshly
+# cloned (or freshly sealed) image.
 #
-# Aufgabe: alles loeschen, was pro Maschine einzigartig sein muss. Der
-# anschliessende Neustart laesst systemd, sshd und k3s die Werte sauber neu
-# erzeugen. Ein fruehes Loeschen im laufenden Betrieb (klassischer Sysprep)
-# waere hier nicht moeglich, weil der Master fuer den Snapshot laufen muss.
+# Job: delete everything that must be unique per machine. The following
+# reboot lets systemd, sshd and k3s regenerate the values cleanly.
+# Deleting them early while running (classic sysprep) is not possible
+# here, because the master has to keep running for the snapshot.
 #
 set -uo pipefail
 
@@ -329,18 +329,18 @@ SEAL=/etc/civitas/sealed
 say() { echo "civitas-firstboot: $*" >&2; }
 say "versiegeltes Image erkannt, Maschinenidentitaet wird neu erzeugt"
 
-# --- SSH-Host-Keys ---------------------------------------------------------
+# --- SSH host keys ---------------------------------------------------------
 rm -f /etc/ssh/ssh_host_*
 
 # --- machine-id ------------------------------------------------------------
-# Leere Datei: systemd erzeugt beim naechsten Boot eine neue ID.
+# Empty file: systemd generates a new ID on the next boot.
 : >/etc/machine-id
 rm -f /var/lib/dbus/machine-id
 ln -sf /etc/machine-id /var/lib/dbus/machine-id
 
-# --- Netz und Hostname -----------------------------------------------------
-# Die Instanzkonfiguration des Masters darf nicht mit in den Klon, sonst gibt
-# es einen IP-Konflikt. Der DHCP-Fallback (01-) bleibt liegen.
+# --- Network and hostname --------------------------------------------------
+# The master's instance config must not end up in the clone, otherwise there
+# is an IP conflict. The DHCP fallback (01-) stays in place.
 rm -f /etc/netplan/10-civitas-instance.yaml /etc/netplan/50-cloud-init.yaml
 echo civitas-unconfigured >/etc/hostname
 if [[ -w /etc/hosts ]]; then
@@ -349,8 +349,8 @@ if [[ -w /etc/hosts ]]; then
 fi
 
 # --- k3s -------------------------------------------------------------------
-# Das dynamische Serverzertifikat traegt die alte Node-IP in den SANs.
-# Nach dem Loeschen baut k3s es beim Start neu auf.
+# The dynamic server certificate carries the old node IP in its SANs.
+# After deleting it, k3s rebuilds it on start.
 rm -f /var/lib/rancher/k3s/server/tls/dynamic-cert.json
 rm -rf /var/log/pods/* /var/log/containers/*
 
@@ -360,9 +360,9 @@ if command -v cloud-init >/dev/null 2>&1; then
 fi
 rm -rf /var/lib/cloud/instances/* /var/lib/cloud/data/* 2>/dev/null || true
 
-# Ohne DHCP im Segment steht der Klon nach dem Boot ohne Adresse da. Damit
-# derjenige an der Hypervisor-Konsole nicht suchen muss, steht der noetige
-# Befehl direkt ueber dem Login-Prompt.
+# Without DHCP in the segment the clone boots without an address. So that
+# whoever sits at the hypervisor console doesn't have to search, the
+# required command is shown right above the login prompt.
 cat >/etc/issue <<'ISSUE'
 
   CIVITAS-Klon, noch nicht personalisiert.
@@ -374,11 +374,11 @@ cat >/etc/issue <<'ISSUE'
 
 ISSUE
 
-# Beim naechsten Boot raeumt civitas-clusterfix die Pods auf, die aus dem
-# Snapshot stammen. Ihre Container-Namen sind in containerd noch von der alten
-# Instanz reserviert, das Kubelet scheitert sonst endlos mit
+# On the next boot civitas-clusterfix cleans up the pods that came from the
+# snapshot. Their container names are still reserved in containerd by the old
+# instance, otherwise the kubelet fails endlessly with
 #   failed to reserve container name ... is reserved for <container-id>
-# und der Pod bleibt in CreateContainerError haengen.
+# and the pod stays stuck in CreateContainerError.
 touch /etc/civitas/clusterfix-pending
 
 rm -f "$SEAL"
@@ -392,7 +392,7 @@ EOF
 Description=CIVITAS: Erstboot nach dem Klonen (Maschinenidentitaet neu erzeugen)
 Documentation=file:///usr/local/sbin/civitas-firstboot.sh
 ConditionPathExists=/etc/civitas/sealed
-# Bewusst sehr frueh: vor sshd (alte Host-Keys) und vor k3s (alte Node-IP).
+# Deliberately very early: before sshd (old host keys) and before k3s (old node IP).
 DefaultDependencies=no
 After=systemd-remount-fs.service
 Before=sysinit.target shutdown.target
@@ -411,16 +411,16 @@ EOF
   cat >/usr/local/sbin/civitas-clusterfix.sh <<'EOF'
 #!/usr/bin/env bash
 #
-# Laeuft einmalig beim ersten Boot eines Klons, nachdem civitas-firstboot die
-# Identitaet erneuert hat und k3s wieder gestartet ist.
+# Runs once on the first boot of a clone, after civitas-firstboot has
+# renewed the identity and k3s is running again.
 #
-# Aufgabe: Pods entfernen, die aus dem Snapshot stammen. Der Sysprep stoppt
-# k3s, aber die containerd-Metadaten der damals laufenden Container wandern mit
-# ins Image. Im Klon kollidiert dann das alte Pod-Objekt mit der noch
-# reservierten Container-Namensvergabe, und das Kubelet versucht endlos:
+# Job: remove pods that came from the snapshot. Sysprep stops k3s, but the
+# containerd metadata of the containers running at that time is carried
+# into the image. In the clone the old pod object then collides with the
+# still-reserved container name, and the kubelet retries endlessly:
 #   Error: failed to reserve container name "..."; check if another
 #   CreateContainer request is in progress: name "..." is reserved for "..."
-# Ein Loeschen des Pods erzeugt eine neue UID und damit einen neuen Namen.
+# Deleting the pod creates a new UID and thus a new name.
 #
 set -uo pipefail
 
@@ -431,7 +431,7 @@ export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 KUBECTL=/usr/local/bin/kubectl
 say() { echo "civitas-clusterfix: $*" >&2; }
 
-# Auf die API warten - beim ersten Boot dauert der Start laenger als sonst.
+# Wait for the API - on first boot startup takes longer than usual.
 ready=false
 for _ in $(seq 1 120); do
   "$KUBECTL" get --raw=/readyz >/dev/null 2>&1 && { ready=true; break; }
@@ -442,16 +442,16 @@ if ! $ready; then
   exit 0
 fi
 
-# Den Pods eine faire Chance geben, von selbst hochzukommen.
+# Give the pods a fair chance to come up on their own.
 sleep 60
 
 fixed=0
 for ns in kube-system cert-manager ingress-nginx; do
   while read -r pod phase ready_state; do
     [[ -n "$pod" ]] || continue
-    # Alles anfassen, was nicht laeuft oder nicht bereit ist. Laufende,
-    # gesunde Pods bleiben unberuehrt - ein pauschales Loeschen waere
-    # unnoetig teuer.
+    # Touch everything that is not running or not ready. Running,
+    # healthy pods are left alone - deleting everything would be
+    # needlessly expensive.
     if [[ "$phase" != "Running" || "$ready_state" != "true" ]]; then
       say "loesche ${ns}/${pod} (${phase}, ready=${ready_state})"
       "$KUBECTL" -n "$ns" delete pod "$pod" --wait=false >/dev/null 2>&1 && fixed=$((fixed+1))
@@ -512,8 +512,8 @@ if ! $ADDONS_ONLY; then
     rm -rf "$tmp"
   fi
 
-  # helm-diff wird von helmfile benoetigt - fuer root UND den Admin-User,
-  # weil Plugins pro Benutzer im HELM_DATA_HOME liegen.
+  # helmfile needs helm-diff - for root AND the admin user,
+  # because plugins live per user in HELM_DATA_HOME.
   for u in root "$ADMIN_USER"; do
     home=$(getent passwd "$u" | cut -d: -f6)
     [[ -n "$home" ]] || continue
@@ -540,25 +540,25 @@ if ! $ADDONS_ONLY; then
   log "k3s installieren"
   mkdir -p /etc/rancher/k3s
 
-  # Bewusst OHNE --cluster-init: der eingebettete SQLite-Datastore enthaelt
-  # keine Node-IP. etcd wuerde die IP festschreiben und den Klon zerlegen.
+  # Deliberately WITHOUT --cluster-init: the embedded SQLite datastore holds
+  # no node IP. etcd would pin the IP and break the clone.
   cat >/etc/rancher/k3s/config.yaml <<EOF
-# Fester Node-Name -> Hostname des Klons ist frei waehlbar
+# Fixed node name -> the clone's hostname can be chosen freely
 node-name: "${NODE_NAME}"
 
-# Traefik raus: CIVITAS erwartet ingressClass nginx
-# servicelb raus: ingress-nginx laeuft als DaemonSet mit hostNetwork
+# Traefik out: CIVITAS expects ingressClass nginx
+# servicelb out: ingress-nginx runs as DaemonSet with hostNetwork
 disable:
   - traefik
   - servicelb
 
-# NetworkPolicies sind im V2-Deployment deaktiviert
+# NetworkPolicies are disabled in the V2 deployment
 disable-network-policy: true
 
-# 0640 plus Gruppe statt 0600: Mitglieder der Gruppe koennen kubectl ohne
-# sudo benutzen, ohne dass die Datei fuer alle lesbar wird. k3s setzt Modus
-# und Gruppe bei jedem Start neu - das ueberlebt auch eine Zertifikatsrotation,
-# anders als eine Kopie unter ~/.kube/config.
+# 0640 plus group instead of 0600: group members can use kubectl without
+# sudo, without making the file world-readable. k3s resets mode and
+# group on every start - this also survives a certificate rotation,
+# unlike a copy under ~/.kube/config.
 write-kubeconfig-mode: "0640"
 write-kubeconfig-group: "civitas"
 kubelet-arg:
@@ -567,8 +567,8 @@ kubelet-arg:
 EOF
 
   INSTALL_ARGS=()
-  # Bei einer bereits installierten Instanz greift die geaenderte config.yaml
-  # erst nach einem Neustart des Dienstes.
+  # On an already installed instance, the changed config.yaml only takes
+  # effect after a service restart.
   NEEDS_K3S_RESTART=false
   systemctl is-active --quiet k3s && NEEDS_K3S_RESTART=true
   if [[ -n "$K3S_VERSION" ]]; then
@@ -598,9 +598,9 @@ EOF
   chmod 0644 /etc/profile.d/kubeconfig.sh
 fi
 
-# Eine alte Kopie wuerde gegen die Gruppenloesung arbeiten: nach einer
-# Zertifikatsrotation passt ihre CA nicht mehr, und die Fehlermeldung fuehrt
-# in die Irre.
+# An old copy would work against the group approach: after a certificate
+# rotation its CA no longer matches, and the error message is
+# misleading.
 if [[ -f "${ADMIN_HOME}/.kube/config" ]]; then
   mv "${ADMIN_HOME}/.kube/config" "${ADMIN_HOME}/.kube/config.bak-$(date +%Y%m%d)"
   echo "  veraltete ~/.kube/config nach .bak verschoben"
@@ -611,9 +611,9 @@ fi
 # ---------------------------------------------------------------------------
 
 log "StorageClasses"
-# k3s bringt local-path bereits als Default mit. Die Aliase rwo/rwx/loc
-# existieren, damit auch eine global.yaml funktioniert, die explizite
-# StorageClass-Namen setzt (wie in der Nutanix-Instanz).
+# k3s already ships local-path as default. The aliases rwo/rwx/loc
+# exist so that a global.yaml which sets explicit StorageClass names
+# also works (as in the Nutanix instance).
 for sc in rwo rwx loc; do
   cat <<EOF | "$KUBECTL" apply -f -
 apiVersion: storage.k8s.io/v1
@@ -657,11 +657,11 @@ helm upgrade --install cert-manager jetstack/cert-manager \
   --wait --timeout 10m
 wait_for_rollout cert-manager deployment/cert-manager 300s
 
-# Kein ClusterIssuer hier - der braucht eine E-Mail-Adresse und wird pro
-# Instanz in 30-deploy-civitas.sh angelegt.
+# No ClusterIssuer here - it needs an e-mail address and is created per
+# instance in 30-deploy-civitas.sh.
 
 # ---------------------------------------------------------------------------
-# 6 – CIVITAS-Repo und Images vorziehen
+# 6 – CIVITAS repo and image pre-pull
 # ---------------------------------------------------------------------------
 
 if ! $ADDONS_ONLY; then
@@ -683,108 +683,108 @@ if ! $ADDONS_ONLY; then
   mkdir -p /etc/civitas
   cat >/etc/civitas/deploy.env.example <<'CIVITASENV'
 # =============================================================================
-# deploy.env.example  –  Konfiguration einer CIVITAS/CORE-V2-Instanz
+# deploy.env.example  –  configuration of a CIVITAS/CORE V2 instance
 # =============================================================================
 #
-# Wird von 30-deploy-civitas.sh gelesen. Auf dem Klon kopieren und ausfuellen:
+# Read by 30-deploy-civitas.sh. Copy and fill in on the clone:
 #
 #   sudo cp /etc/civitas/deploy.env.example /etc/civitas/deploy.env
 #   sudo nano /etc/civitas/deploy.env
 #   sudo chmod 600 /etc/civitas/deploy.env
 #
-# Voraussetzung: der Node ist bereits personalisiert
+# Prerequisite: the node has already been personalized
 # (sudo bash 25-postclone-setup.sh --hostname ... --ip ...).
 #
-# ACHTUNG: /etc/civitas/deploy.env enthaelt Zugangsdaten. Die Datei wird von
-# 20-sysprep-template.sh geloescht und gehoert nicht ins Image und nicht ins
-# Git-Repo.
+# WARNING: /etc/civitas/deploy.env contains credentials. The file is deleted by
+# 20-sysprep-template.sh and belongs neither in the image nor in the
+# Git repo.
 #
-# Syntax: KEY=wert, eine Zuweisung pro Zeile, keine Leerzeichen um das =.
-# Werte mit Sonderzeichen in doppelte Anfuehrungszeichen setzen.
+# Syntax: KEY=value, one assignment per line, no spaces around the =.
+# Put values containing special characters in double quotes.
 # =============================================================================
 
 
 # -----------------------------------------------------------------------------
-# Pflicht
+# Required
 # -----------------------------------------------------------------------------
 
-# Basis-Domain der Instanz. Am einfachsten ein Wildcard-Record *.<DOMAIN>.
-# Welche Namen genau gebraucht werden, haengt vom Release ab (v2.0.0: api, idm,
-# portal, dashboard, management). 30-deploy-civitas.sh liest die Liste aus dem
-# gerenderten Release und prueft jeden Namen vorab per getent.
+# Base domain of the instance. Easiest is a wildcard record *.<DOMAIN>.
+# Which names are needed exactly depends on the release (v2.0.0: api, idm,
+# portal, dashboard, management). 30-deploy-civitas.sh reads the list from the
+# rendered release and checks every name up front via getent.
 DOMAIN=demo.civitascore.de
 
-# Kurzname der Instanz. Wird gleichzeitig als Kubernetes-Namespace und als
-# Keycloak-Realm verwendet. Nur Kleinbuchstaben, Ziffern und Bindestriche.
-# Muss sich zwischen Instanzen unterscheiden, sonst kollidieren die Realms.
+# Short name of the instance. Used both as Kubernetes namespace and as
+# Keycloak realm. Lowercase letters, digits and hyphens only.
+# Must differ between instances, otherwise the realms collide.
 INSTANCE_SLUG=demo
 
-# Erster Benutzer im Keycloak-Realm. Bekommt die Einladungsmail und damit die
-# Administrationsrechte im Portal. Ohne funktionierendes SMTP kommt diese Mail
-# nicht an - dann das Passwort spaeter ueber die Keycloak-Konsole setzen.
+# First user in the Keycloak realm. Receives the invitation mail and with it
+# admin rights in the portal. Without working SMTP this mail never arrives -
+# in that case set the password later via the Keycloak console.
 INITIAL_USER_EMAIL=admin@example.org
 
-# Kontaktadresse fuer Let's Encrypt. Geht an den ACME-Account, nicht an Nutzer.
-# Hierhin laufen Ablaufwarnungen, wenn ein Zertifikat nicht erneuert wird.
+# Contact address for Let's Encrypt. Goes to the ACME account, not to users.
+# Expiry warnings are sent here if a certificate is not renewed.
 LETSENCRYPT_EMAIL=technik@example.org
 
 
 # -----------------------------------------------------------------------------
-# Zertifikate
+# Certificates
 # -----------------------------------------------------------------------------
 
-# true  = Let's-Encrypt-Staging. Kein Rate Limit, aber der Browser meckert.
-#         Fuer jeden ersten Durchlauf auf einer neuen Domain empfohlen.
-# false = Produktion. Achtung: 5 fehlgeschlagene Validierungen pro Konto und
-#         Stunde, danach ist die Domain fuer eine Stunde gesperrt.
+# true  = Let's Encrypt staging. No rate limit, but the browser complains.
+#         Recommended for every first run on a new domain.
+# false = Production. Caution: 5 failed validations per account and
+#         hour, after that the domain is locked for one hour.
 #
-# Der ClusterIssuer heisst in beiden Faellen letsencrypt-prod, weil die
-# CIVITAS-Ingresses ihn so referenzieren. Nur der ACME-Endpunkt wechselt.
-# Nach dem Wechsel von staging auf prod die Secrets der Zertifikate loeschen:
+# The ClusterIssuer is called letsencrypt-prod in both cases, because the
+# CIVITAS ingresses reference it by that name. Only the ACME endpoint changes.
+# After switching from staging to prod, delete the certificate secrets:
 #   kubectl -n <slug> delete secret -l cert-manager.io/certificate-name
 LETSENCRYPT_STAGING=true
 
 
 # -----------------------------------------------------------------------------
-# Netzwerk
+# Network
 # -----------------------------------------------------------------------------
 
-# Node-IP fuer den CoreDNS-Split-Horizon. Leer lassen = wird aus dem
-# Kubernetes-Node-Objekt ermittelt, ersatzweise aus der Default-Route.
+# Node IP for the CoreDNS split horizon. Leave empty = taken from the
+# Kubernetes node object, falling back to the default route.
 #
-# Nur setzen, wenn die automatische Ermittlung die falsche Adresse liefert,
-# etwa bei mehreren Interfaces. Weicht der Wert von der tatsaechlichen Adresse
-# ab, bricht 30-deploy-civitas.sh mit einem Hinweis auf 25-postclone-setup.sh ab.
+# Only set it if auto-detection picks the wrong address, e.g. with
+# multiple interfaces. If the value differs from the actual address,
+# 30-deploy-civitas.sh aborts and points to 25-postclone-setup.sh.
 NODE_IP=
 
-# Oeffentliche Adresse, auf die die DNS-Namen zeigen, wenn die Instanz hinter
-# NAT steht - also die Adresse, unter der Let's Encrypt die Instanz erreicht.
+# Public address the DNS names point to when the instance sits behind
+# NAT - i.e. the address under which Let's Encrypt reaches the instance.
 #
-# Leer lassen ist erlaubt: zeigen alle Namen einheitlich auf dieselbe
-# Adresse, die nicht die Node-IP ist, erkennt das Skript die NAT-Situation und
-# akzeptiert sie. Eintragen macht die Pruefung nur eindeutiger - dann faellt
-# auch auf, wenn ein Record versehentlich auf die falsche Instanz zeigt.
+# Leaving it empty is allowed: if all names consistently point to the same
+# address that is not the node IP, the script detects the NAT setup and
+# accepts it. Setting it only makes the check stricter - it then also
+# catches a record that accidentally points to the wrong instance.
 #
-# Beispiel: PUBLIC_IP=93.88.227.82
+# Example: PUBLIC_IP=93.88.227.82
 PUBLIC_IP=
 
-# Zusaetzliche Hostnamen fuer den Split-Horizon, ohne Domain-Suffix, durch
-# Leerzeichen getrennt. Die Hosts aus dem Release werden automatisch ermittelt
-# und muessen hier nicht stehen.
-# Beispiel fuer eine Instanz mit eigenem NiFi- und MinIO-Ingress:
+# Additional host names for the split horizon, without domain suffix,
+# separated by spaces. Hosts from the release are detected automatically
+# and do not need to be listed here.
+# Example for an instance with its own NiFi and MinIO ingress:
 #   EXTRA_HOSTS="nifi s3"
 EXTRA_HOSTS=""
 
 
 # -----------------------------------------------------------------------------
-# SMTP  (Keycloak: Einladungen, Passwort-Reset, Verifikationsmails)
+# SMTP  (Keycloak: invitations, password reset, verification mails)
 # -----------------------------------------------------------------------------
 #
-# Landet im Secret keycloak-smtp im Namespace der Instanz. Bleibt SMTP_HOST
-# leer, laeuft das Deployment durch, aber Keycloak kann keine Mails versenden -
-# der initiale Benutzer bekommt dann keine Einladung.
+# Stored in the secret keycloak-smtp in the instance namespace. If SMTP_HOST
+# stays empty, the deployment still succeeds, but Keycloak cannot send mail -
+# the initial user then gets no invitation.
 #
-# Auf Port 587 erwartet Keycloak STARTTLS, auf 465 implizites SSL.
+# On port 587 Keycloak expects STARTTLS, on 465 implicit SSL.
 
 SMTP_HOST=smtp.example.org
 SMTP_PORT=587
@@ -797,42 +797,42 @@ SMTP_PASSWORD=
 # Optional
 # -----------------------------------------------------------------------------
 
-# Tag oder Branch, von dem deployt wird.
+# Tag or branch to deploy from.
 #
-# Leer oder auskommentiert = der Stand, der im Image ausgecheckt ist
-# (bei diesem Template v2.0.0). Das ist der Normalfall und der schnellste
-# Weg, weil die Container-Images dazu bereits im Node liegen.
+# Empty or commented out = the revision checked out in the image
+# (v2.0.0 for this template). This is the normal case and the fastest
+# path, because the matching container images are already on the node.
 #
-# Ein abweichender Wert schaltet NUR die Arbeitskopie unter
-# /opt/civitas/rendered/repo um; das Repo unter /opt/civitas/civitas-core-deployment
-# bleibt unangetastet. Liegt die Referenz nicht lokal vor, wird sie vom Remote
-# geholt - dafuer braucht die VM Netzzugang zum GitLab.
+# A different value ONLY switches the working copy under
+# /opt/civitas/rendered/repo; the repo under /opt/civitas/civitas-core-deployment
+# stays untouched. If the ref is not available locally, it is fetched from the
+# remote - this requires network access to GitLab.
 #
-# Beispiele:
-#   CIVITAS_REF=v2.0-rc2     # anderer Tag
-#   CIVITAS_REF=main         # Branch, wird auf origin/main aufgeloest
-#   CIVITAS_REF=a1b2c3d      # einzelner Commit
+# Examples:
+#   CIVITAS_REF=v2.0-rc2     # different tag
+#   CIVITAS_REF=main         # branch, resolved to origin/main
+#   CIVITAS_REF=a1b2c3d      # single commit
 #
-# Achtung: Bei einem anderen Stand koennen Repo-Struktur und Image-Versionen
-# abweichen. Erst mit LETSENCRYPT_STAGING=true testen.
+# Caution: with a different revision, repo structure and image versions may
+# differ. Test with LETSENCRYPT_STAGING=true first.
 #CIVITAS_REF=
 
-# Pfad zum ausgecheckten civitas-core-deployment-Repo. Nur aendern, wenn im
-# Template ein abweichender Ort verwendet wurde.
+# Path to the checked-out civitas-core-deployment repo. Only change it if a
+# different location was used in the template.
 #CIVITAS_DIR=/opt/civitas/civitas-core-deployment
 
-# Skripte vor jedem Deploy aus Git aktualisieren. 30-deploy-civitas.sh holt
-# SCRIPTS_REF aus SCRIPTS_REPO, legt die Skripte nach /opt/civitas/scripts und
-# startet sich mit der neuen Fassung neu. So kommen Anpassungen an neue
-# CIVITAS-Releases auf bestehende Klone, ohne das Image neu zu bauen.
+# Update the scripts from Git before every deploy. 30-deploy-civitas.sh fetches
+# SCRIPTS_REF from SCRIPTS_REPO, installs the scripts to /opt/civitas/scripts and
+# restarts itself with the new version. This brings adjustments for new
+# CIVITAS releases to existing clones without rebuilding the image.
 #
-# Leer = aus, es laeuft die Fassung aus dem Image. Einmalig abschalten:
+# Empty = off, the version from the image runs. Skip once:
 #   sudo bash /opt/civitas/scripts/30-deploy-civitas.sh --no-update
 #
-# Das Repo muss ohne Anmeldung erreichbar sein. Die Skripte laufen als root -
-# wer sicher gehen will, setzt hier einen Tag statt eines Branches.
+# The repo must be reachable without authentication. The scripts run as root -
+# to be on the safe side, set a tag here instead of a branch.
 SCRIPTS_REF=main
-#SCRIPTS_REPO=https://github.com/BronxHD/civitas-core-demo_clone_setup-.git
+#SCRIPTS_REPO=
 CIVITASENV
   chmod 0644 /etc/civitas/deploy.env.example
 
@@ -885,7 +885,7 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 7 – Build protokollieren
+# 7 – Log the build
 # ---------------------------------------------------------------------------
 
 log "Build protokollieren"

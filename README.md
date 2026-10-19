@@ -1,245 +1,127 @@
-# CIVITAS/CORE V2 – klonbares VM-Template
+# CIVITAS/CORE V2 – clonable VM template
 
-Ein Image bauen, dann pro Demo-Instanz klonen und zwei Skripte laufen lassen.
+Scripts to build a **golden Ubuntu VM image** with a ready-to-use single-node Kubernetes
+(k3s) and to spin up any number of **[CIVITAS/CORE V2](https://gitlab.com/civitas-connect/civitas-core/civitas-core-v2/civitas-core-deployment)
+demo instances** from it – one clone per instance, each with its own domain and Let's Encrypt
+certificates.
 
-| Skript | Wo | Was |
+The image is built once. Every clone then needs only two commands: one to personalize the
+node (hostname, IP) and one to deploy CIVITAS/CORE. Container images are pre-pulled
+in the image, so a deployment takes minutes instead of hours.
+
+## How it works
+
+```
+ Ubuntu 24.04 VM ──10-build──▶ golden image ──20-sysprep──▶ snapshot
+                                                               │ clone
+                                                               ▼
+                                   new VM ──25-postclone──▶ node ──30-deploy──▶ CIVITAS/CORE instance
+```
+
+| Script | Runs on | What it does |
 |---|---|---|
-| `10-build-template.sh` | Master, einmalig | k3s, ingress-nginx, cert-manager, Tooling, Repo, Klon-Automatik |
-| `20-sysprep-template.sh` | Master, vor dem Snapshot | versiegelt das Image |
-| `25-postclone-setup.sh` | jeder Klon, nach dem Erstboot | Hostname, feste IP, k3s auf die neue IP |
-| `30-deploy-civitas.sh` | jeder Klon, danach | ClusterIssuer, DNS, Secrets, Rollout |
+| `10-build-template.sh` | master, once | Hardening (SSH, ufw, fail2ban, auto-updates), k3s, ingress-nginx, cert-manager, helm/helmfile, CIVITAS repo + image pre-pull, first-boot automation |
+| `20-sysprep-template.sh` | master, before every snapshot | Seals the image: stops k3s, removes credentials and logs, sets the first-boot marker |
+| `25-postclone-setup.sh` | each clone | Sets hostname and static IP, moves k3s to the new IP |
+| `30-deploy-civitas.sh` | each clone | ClusterIssuer, CoreDNS split horizon, secrets, `helmfile` rollout |
 
-Alle Skripte liegen im Image unter `/opt/civitas/scripts/` und werden **mit `bash`**
-aufgerufen, nie mit `sh` — `sh` ist dash und kennt `[[ ]]` nicht.
+On the first boot of a clone, `civitas-firstboot.service` automatically generates a new
+`machine-id` and new SSH host keys, then reboots once. Nothing domain- or IP-specific is
+baked into the image.
+
+**Requirements:** Ubuntu 24.04 VM, ≥ 16 GB RAM, ≥ 40 GB disk, a sudo user with an SSH key,
+ports 80/443 reachable from the internet, and a DNS record per instance.
+
+Always run the scripts with `bash`, not `sh`.
 
 ---
 
-## A – Golden Image erzeugen (Master)
-
-Leere Ubuntu-24.04-VM mit sudo-Benutzer und hinterlegtem SSH-Key. Skripte holen:
+## 1. Build the image (master)
 
 ```bash
 sudo git clone https://github.com/BronxHD/civitas-core-demo_clone_setup-.git /opt/civitas/scripts-src
 sudo install -d -m 0755 /opt/civitas/scripts
 sudo install -m 0755 /opt/civitas/scripts-src/*.sh /opt/civitas/scripts/
 sudo install -m 0644 /opt/civitas/scripts-src/deploy.env.example /opt/civitas/scripts/
-```
 
-Image bauen:
-
-```bash
 tmux new -s build
 sudo bash /opt/civitas/scripts/10-build-template.sh
 ```
 
-Beim Nachbauen eines bestehenden Images die Versionen mitgeben, sonst zieht der Lauf
-alles auf latest hoch:
+To rebuild with the same versions instead of `latest`, pass the values from
+`/etc/civitas/template.env`, e.g. `sudo K3S_VERSION=... CERT_MANAGER_VERSION=... CIVITAS_TAG=v2.0.0 bash ...`.
 
-```bash
-cat /etc/civitas/template.env
-sudo K3S_VERSION="v1.36.3+k3s1" CERT_MANAGER_VERSION="v1.21.1" \
-     HELMFILE_VERSION="1.7.2" CIVITAS_TAG="v2.0.0" PREPULL_IMAGES=false \
-     bash /opt/civitas/scripts/10-build-template.sh
-```
-
-Prüfen:
-
-```bash
-systemctl is-enabled civitas-firstboot.service            # enabled
-stat -c '%a %G' /etc/rancher/k3s/k3s.yaml                 # 640 civitas
-timedatectl | grep synchronized                           # yes
-kubectl get pods -A                                       # alles Running
-curl -I http://127.0.0.1                                  # 404 vom nginx
-sudo openssl x509 -in /var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt \
-     -noout -dates                                        # notBefore in der Vergangenheit
-```
-
-Versiegeln:
+Then seal it and take the snapshot in the hypervisor (the VM may keep running):
 
 ```bash
 sudo bash /opt/civitas/scripts/20-sysprep-template.sh
-ls -l /etc/civitas/sealed        # muss existieren
-systemctl is-active k3s          # inactive
 ```
 
-Sally erzeugt jetzt den Snapshot — laufend oder heruntergefahren, beides geht. **Den
-Master bis dahin nicht neu starten**, jeder Boot verbraucht die Markierung.
+Do **not** reboot the master before the snapshot is taken. Afterwards `sudo reboot` it
+and personalize it like a clone (step 2).
 
-Danach den Master zurückholen: `sudo reboot` (er startet zweimal), dann Abschnitt B mit
-seinen eigenen Werten.
+## 2. Personalize a clone
+
+Boot the clone. It reboots once by itself. Then, **on a single line**:
+
+```bash
+sudo bash /opt/civitas/scripts/25-postclone-setup.sh --hostname civitas-demo1 --ip 10.0.0.11/24 --gateway 10.0.0.1 --dns 1.1.1.1
+```
+
+Without DHCP the clone has no address after boot. The exact command is shown above the
+console login prompt. Use `--check` to compare the identity with other clones. Log in
+again afterwards to use `kubectl` without `sudo`.
+
+## 3. Deploy CIVITAS/CORE
+
+1. **DNS:** create a wildcard record `*.<domain>` pointing to the instance's public (NAT)
+   address. Port 80 must be reachable from outside for the Let's Encrypt HTTP-01 challenge.
+2. **Configure:**
+   ```bash
+   sudo cp /etc/civitas/deploy.env.example /etc/civitas/deploy.env
+   sudo nano /etc/civitas/deploy.env
+   sudo chmod 600 /etc/civitas/deploy.env
+   ```
+   Required: `DOMAIN`, `INSTANCE_SLUG`, `INITIAL_USER_EMAIL`, `LETSENCRYPT_EMAIL`.
+   Optional: SMTP settings (for Keycloak mails), `PUBLIC_IP`, `CIVITAS_REF`.
+   Keep `LETSENCRYPT_STAGING=true` for the first run on a new domain.
+3. **Deploy** (takes several minutes):
+   ```bash
+   tmux new -s deploy
+   sudo bash /opt/civitas/scripts/30-deploy-civitas.sh
+   ```
+   The script renders and validates the release before touching the cluster and checks
+   all DNS names up front. At the end it prints the URLs and the Keycloak admin password.
+4. **Switch to production certificates** once everything works on staging: set
+   `LETSENCRYPT_STAGING=false` and run the script again. Old staging certificates are
+   replaced automatically.
+
+Other options: `--diff` (preview only), `--reset` (wipe and rebuild the instance),
+`--prepare` (only issuer/DNS/secrets), `--no-update` (skip the script self-update).
 
 ---
 
-## B – Klon personalisieren
+## Updates
 
-Sally klont und startet die VM. Mehr muss sie nicht tun.
+- **New CIVITAS version:** no new image needed. Set `CIVITAS_REF=<tag>` in
+  `/etc/civitas/deploy.env` and run `30-deploy-civitas.sh` (optionally with `--diff` first).
+- **Script updates:** with `SCRIPTS_REF` set in `deploy.env`, `30-deploy-civitas.sh` pulls the
+  scripts from this repo before every run. They run as root, so use a tag rather
+  than a branch if you want to control exactly what runs.
+- **New image:** rebuild every 3–6 months. The k3s certificates in the template expire after
+  12 months. Run `20-sysprep-template.sh` again before **every** snapshot.
 
-Der Klon startet zweimal: `civitas-firstboot` erzeugt eine neue `machine-id`, neue
-SSH-Host-Keys und verwirft die Netzkonfiguration des Masters. Ohne DHCP im Segment hängt
-er danach ohne Adresse da — der nötige Befehl steht über dem Login-Prompt der Konsole.
-**Alles in einer Zeile**, ohne Backslash:
+The image is the unit of maintenance: if an instance drifts or breaks, throw it away and clone
+a new one.
 
-```bash
-sudo bash /opt/civitas/scripts/25-postclone-setup.sh --hostname civitas-demo2 --ip 192.168.210.102/24 --gateway 192.168.210.1 --dns 8.8.8.8
-```
+## Troubleshooting
 
-Das Skript wartet auf die NTP-Synchronisation, rotiert bei Bedarf die k3s-Zertifikate,
-stellt die Node-IP um und nimmt dich in die Gruppe `civitas` auf. Für `kubectl` ohne
-`sudo` einmal neu anmelden.
-
-Gegenprobe zum Master:
-
-```bash
-sudo bash /opt/civitas/scripts/25-postclone-setup.sh --check
-```
-
-Unterscheiden müssen sich: Hostname, `machine-id`, SSH-Host-Key, IP, k3s-Node-IP.
-Gleich sein dürfen: Node-Name `civitas-node`, Cluster-CA, Pod-CIDR, Image-Store.
-
----
-
-## C – CIVITAS/CORE deployen
-
-**1. DNS.** Pro Instanz ein Wildcard-A-Record auf die *öffentliche* NAT-Adresse:
-
-```
-*.demo2.ghost-website.de   A   93.88.227.78   (TTL 300)
-```
-
-Ohne Wildcard braucht jeder Hostname des Releases einen eigenen Record (v2.0.0: api, idm,
-portal, dashboard, management). Das Deploy-Skript liest die Liste aus dem gerenderten
-Release, gibt sie aus und prüft jeden Namen, bevor es etwas am Cluster ändert.
-
-**2. Erreichbarkeit von außen prüfen** — vom Handy-Hotspot, nicht aus dem Firmennetz:
-
-```bash
-curl -I --max-time 10 http://93.88.227.78/.well-known/acme-challenge/test
-```
-
-Ein `404` vom nginx ist die gute Antwort. Ein Timeout heißt: Let's Encrypt kann nicht
-validieren, dann muss Port 80 freigegeben werden.
-
-**3. Konfigurieren.**
-
-```bash
-sudo cp /etc/civitas/deploy.env.example /etc/civitas/deploy.env
-sudo nano /etc/civitas/deploy.env
-sudo chmod 600 /etc/civitas/deploy.env
-```
-
-Pflichtfelder: `DOMAIN`, `INSTANCE_SLUG`, `INITIAL_USER_EMAIL`, `LETSENCRYPT_EMAIL`.
-Steht die Instanz hinter NAT, kann `PUBLIC_IP` gesetzt werden — nötig ist es nicht, das
-Skript erkennt die NAT-Situation auch selbst.
-Dazu SMTP, falls Keycloak Mails verschicken soll. Bei einer neuen Domain
-`LETSENCRYPT_STAGING=true` lassen — die Produktions-CA sperrt nach fünf fehlgeschlagenen
-Validierungen pro Stunde.
-
-Optional `CIVITAS_REF`, um von einem anderen Tag oder Branch zu deployen. Leer heißt:
-der Stand aus dem Image.
-
-`SCRIPTS_REF=main` (Standard in der Vorlage) holt vor jedem Lauf die aktuellen Skripte aus
-GitHub. Leer schaltet das ab, `--no-update` überspringt es einmalig.
-
-**4. Ausrollen.** In tmux, der Lauf dauert etliche Minuten ohne viel Ausgabe:
-
-```bash
-tmux new -s deploy
-sudo bash /opt/civitas/scripts/30-deploy-civitas.sh
-```
-
-Das Skript aktualisiert sich zuerst selbst (`SCRIPTS_REF`) und rendert dann das Release
-als Vorabprüfung. Scheitert das, bricht es ab, bevor am Cluster etwas passiert. Danach
-legt es ClusterIssuer, CoreDNS-Split-Horizon, Namespace und Secrets an und rollt in zwei
-Schritten aus: erst `helmfile-operators.yaml`, nach dem Bereitwerden der Webhooks
-`helmfile-instance.yaml.gotmpl`.
-
-**5. Prüfen.**
-
-```bash
-kubectl -n demo2 get pods
-kubectl -n demo2 get certificate                 # READY=True
-echo | openssl s_client -connect 127.0.0.1:443 -servername portal.demo2.ghost-website.de \
-  2>/dev/null | openssl x509 -noout -issuer -dates
-```
-
-**6. Auf Produktion umstellen**, wenn mit Staging alles läuft:
-
-```bash
-sudo sed -i 's/^LETSENCRYPT_STAGING=.*/LETSENCRYPT_STAGING=false/' /etc/civitas/deploy.env
-sudo bash /opt/civitas/scripts/30-deploy-civitas.sh
-```
-
-Das Skript erkennt am Aussteller, dass die vorhandenen Zertifikate nicht mehr zum Modus
-passen, verwirft sie und lässt neu ausstellen. Im `issuer` darf danach kein `(STAGING)`
-mehr stehen.
-
-Weitere Optionen: `--diff` zeigt nur die Vorschau, `--reset` wirft die Instanz weg und
-baut sie neu auf.
-
----
-
-## Neue CIVITAS-Version
-
-Kein neues Image nötig. Auf dem Klon in `/etc/civitas/deploy.env` setzen:
-
-```bash
-CIVITAS_REF=v2.1.0
-```
-
-und `30-deploy-civitas.sh` laufen lassen (vorher gern mit `--diff`). Mussten die Skripte
-für das Release angepasst werden, reicht ein Push nach GitHub: jeder Klon holt sie über
-`SCRIPTS_REF` beim nächsten Lauf. Ein neues Image lohnt sich nur, damit die Images der neuen
-Version schon vorgeladen sind, oder weil k3s-Zertifikate bzw. OS-Updates es ohnehin fällig
-machen.
-
-## Skripte auf einer laufenden VM aktualisieren
-
-Mit `SCRIPTS_REF` in der `deploy.env` passiert das automatisch. Für ältere Klone ohne diese
-Variable einmalig von Hand:
-
-```bash
-sudo chmod 0755 /opt/civitas/scripts/*.sh
-sudo chmod 0644 /opt/civitas/scripts/deploy.env.example
-sudo cp /opt/civitas/scripts/deploy.env.example /etc/civitas/
-
-# welche Fassung liegt hier?
-grep -c "helmfile-operators" /opt/civitas/scripts/30-deploy-civitas.sh   # > 0
-grep -c "civitas-firstboot"  /opt/civitas/scripts/10-build-template.sh   # > 0
-grep -n 'DEPLOY_DIR="'       /opt/civitas/scripts/30-deploy-civitas.sh   # ${REPO_COPY}/deployment
-```
-
-Neue Skripte allein ändern nichts am System — Gruppe `civitas`, firstboot-Dienst und
-DHCP-Fallback entstehen erst beim Lauf von `10-build-template.sh`.
-
----
-
-## Wenn etwas klemmt
-
-| Symptom | Ursache |
+| Symptom | Fix |
 |---|---|
-| `[[: not found` | mit `sh` statt `bash` aufgerufen |
-| `Unbekannte Option:  --ip` | Backslash beim Einfügen in die Konsole, alles in eine Zeile tippen |
-| `Missing privilege separation directory` | `sudo install -d -m 0755 /run/sshd` |
-| `certificate is not yet valid` | Uhr ging beim Boot falsch → `k3s certificate rotate` bei gestopptem Dienst |
-| `permission denied` bei kubectl | nach dem Build einmal neu anmelden (Gruppe `civitas`) |
-| `no matches for path: ../helmfile-root…` | veraltete Skriptfassung, `DEPLOY_DIR` muss `${REPO_COPY}/deployment` sein |
-| Pods in `CreateContainerError`, `name ... is reserved for` | Container-Namen aus dem Snapshot → `kubectl -n <ns> delete pod --all`; `civitas-clusterfix` macht das beim ersten Boot automatisch |
-| DNS-Warnung „erwartet 192.168.x.y" bei NAT | behoben — bei einheitlicher öffentlicher Adresse ist das kein Fehler mehr; optional `PUBLIC_IP` setzen |
-| `no endpoints available for service cert-manager-webhook` | zu früh gestartet, cert-manager war noch nicht bereit → einfach erneut laufen lassen |
-| CoreDNS in CrashLoopBackOff | Schlüssel in `coredns-custom` muss `.server` heißen, nicht `.override` |
-| NiFi `SunCertPathBuilderException` | Truststore passt nicht zur ACME-Umgebung |
-| Helm hängt in `pending-upgrade` | SSH-Abriss mittendrin → `helm rollback <release> -n <ns>` |
-| `apt` kriecht bei ~50 kB/s | toter Mirror → auf `de.archive.ubuntu.com` wechseln |
-
-Ausführliche Erklärungen dazu stehen in `REFERENCE.md`.
-
----
-
-## Wartung
-
-Das Image ist die Wartungseinheit, nicht der laufende Server. Eine Instanz driftet oder
-stirbt → wegwerfen und neu klonen.
-
-Vor **jedem** neuen Snapshot muss `20-sysprep-template.sh` erneut laufen; die Markierung
-wird beim Erstboot verbraucht. Image alle 3–6 Monate neu bauen — die k3s-Zertifikate im
-Template laufen nach 12 Monaten ab.
+| `[[: not found` | Run with `bash`, not `sh` |
+| `Unbekannte Option: --ip` | Line break/backslash when pasting – enter the command on one line |
+| `certificate is not yet valid` | Clock was wrong at boot – `25-postclone-setup.sh` rotates the k3s certificates; check NTP |
+| `permission denied` with kubectl | Log in again (group `civitas`) |
+| `no endpoints available for service cert-manager-webhook` | cert-manager was not ready yet – just run the script again |
+| Helm release stuck in `pending-upgrade` | SSH dropped mid-run – `helm rollback <release> -n <ns>`, then always use tmux |
+| Let's Encrypt challenge times out | Port 80 not reachable from outside, or DNS points elsewhere |

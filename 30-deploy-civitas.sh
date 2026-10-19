@@ -2,24 +2,24 @@
 #
 # 30-deploy-civitas.sh
 #
-# Laeuft auf dem frisch geklonten Node und macht alles, was Domain oder IP kennt:
-#   - optional: Skripte unter /opt/civitas/scripts aus dem Git-Repo aktualisieren
-#   - Release rendern und daraus die Hostnamen ableiten (keine feste Liste)
-#   - ClusterIssuer (Let's Encrypt prod oder staging)
-#   - CoreDNS-Split-Horizon ueber die coredns-custom ConfigMap
-#   - Namespace, keycloak-smtp, custom-ca-cert
-#   - global.yaml.gotmpl rendern, dann helmfile-operators und helmfile-instance
-#   - CoreDNS-Eintraege aus den tatsaechlichen Ingresses nachziehen
+# Runs on the freshly cloned node and does everything that knows the domain or IP:
+#   - optional: update the scripts under /opt/civitas/scripts from the Git repo
+#   - render the release and derive the host names from it (no fixed list)
+#   - ClusterIssuer (Let's Encrypt prod or staging)
+#   - CoreDNS split horizon via the coredns-custom ConfigMap
+#   - namespace, keycloak-smtp, custom-ca-cert
+#   - render global.yaml.gotmpl, then helmfile-operators and helmfile-instance
+#   - update CoreDNS entries from the actual ingresses
 #
-# Voraussetzung: /etc/civitas/deploy.env (Vorlage: /etc/civitas/deploy.env.example)
-#                Node ist personalisiert (./25-postclone-setup.sh gelaufen)
+# Prerequisite: /etc/civitas/deploy.env (template: /etc/civitas/deploy.env.example)
+#               node is personalized (./25-postclone-setup.sh has run)
 #
-# Aufruf:
-#   sudo ./30-deploy-civitas.sh              # voller Rollout
-#   sudo ./30-deploy-civitas.sh --diff       # nur Vorschau, aendert nichts am Release
-#   sudo ./30-deploy-civitas.sh --reset      # Instanz loeschen und neu aufbauen
-#   sudo ./30-deploy-civitas.sh --prepare    # nur Issuer/DNS/Namespace/Secrets
-#   sudo ./30-deploy-civitas.sh --no-update  # Skripte nicht aus Git aktualisieren
+# Usage:
+#   sudo ./30-deploy-civitas.sh              # full rollout
+#   sudo ./30-deploy-civitas.sh --diff       # preview only, does not change the release
+#   sudo ./30-deploy-civitas.sh --reset      # delete the instance and rebuild it
+#   sudo ./30-deploy-civitas.sh --prepare    # only issuer/DNS/namespace/secrets
+#   sudo ./30-deploy-civitas.sh --no-update  # do not update the scripts from Git
 #
 
 log()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -28,13 +28,13 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Bitte mit sudo ausfuehren."
 
-# In ein stabiles Verzeichnis wechseln, das dieses Skript garantiert nicht anfasst.
-# Wurde das Skript aus /opt/civitas/rendered/... heraus aufgerufen (z.B. weil man
-# vorher zum Debuggen dorthin gecd't hat), reisst der spaetere rm -rf/cp -a des
-# Repo-Copys (Schritt 7) genau dieses Arbeitsverzeichnis unter dem laufenden Prozess
-# weg. Jeder folgende getcwd()-Aufruf - auch in helmfile selbst - schlaegt dann mit
-# "no such file or directory" fehl, obwohl unter demselben Pfad laengst wieder ein
-# frisches Verzeichnis existiert (neue Inode, alte cwd-Bindung ist aber tot).
+# Change into a stable directory that this script is guaranteed not to touch.
+# If the script was started from within /opt/civitas/rendered/... (e.g. because you
+# cd'ed there for debugging), the later rm -rf/cp -a of the repo copy (step 7)
+# pulls exactly this working directory out from under the running process.
+# Every following getcwd() call - including in helmfile itself - then fails with
+# "no such file or directory", even though a fresh directory already exists at the
+# same path again (new inode, but the old cwd binding is dead).
 cd /opt/civitas || die "cd /opt/civitas fehlgeschlagen"
 
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -53,11 +53,11 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# 1 – Konfiguration laden und pruefen
+# 1 – Load and validate configuration
 # ---------------------------------------------------------------------------
 
-# Versiegeltes Image: civitas-firstboot hat noch nicht gelaufen. Ein Deployment
-# wuerde beim naechsten Boot komplett neu personalisiert und damit zerlegt.
+# Sealed image: civitas-firstboot has not run yet. A deployment would be
+# completely re-personalized on the next boot and thus broken.
 [[ -e /etc/civitas/sealed ]] \
   && die "Diese VM ist noch versiegelt (/etc/civitas/sealed). Erst neu starten, dann ./25-postclone-setup.sh, dann dieses Skript."
 
@@ -69,10 +69,10 @@ set -a
 set +a
 
 # ---------------------------------------------------------------------------
-# 1a – Skripte aus Git aktualisieren (optional)
+# 1a – Update scripts from Git (optional)
 #
-# Damit kommen Anpassungen an neue CIVITAS-Releases auf bestehende Klone,
-# ohne das Image neu zu bauen. Leeres SCRIPTS_REF schaltet das ab.
+# This brings adjustments for new CIVITAS releases to existing clones
+# without rebuilding the image. An empty SCRIPTS_REF disables it.
 # ---------------------------------------------------------------------------
 
 SCRIPTS_REPO="${SCRIPTS_REPO:-https://github.com/BronxHD/civitas-core-demo_clone_setup-.git}"
@@ -81,8 +81,8 @@ SCRIPTS_DIR=/opt/civitas/scripts
 SCRIPTS_SRC=/opt/civitas/scripts-src
 
 update_scripts() {
-  # Ohne Terminal-Prompt: ein nicht erreichbares oder privates Repo soll
-  # scheitern, nicht auf einen Benutzernamen warten.
+  # No terminal prompt: an unreachable or private repo should
+  # fail instead of waiting for a username.
   export GIT_TERMINAL_PROMPT=0
   if [[ -d "${SCRIPTS_SRC}/.git" ]]; then
     git -C "$SCRIPTS_SRC" remote set-url origin "$SCRIPTS_REPO"
@@ -98,14 +98,14 @@ update_scripts() {
   fi
   git -C "$SCRIPTS_SRC" checkout --quiet --detach "$target" || return 1
 
-  # Eine kaputte Fassung darf die funktionierende nicht ersetzen.
+  # A broken version must not replace the working one.
   for f in "$SCRIPTS_SRC"/*.sh; do
     bash -n "$f" || { warn "  Syntaxfehler in $(basename "$f") - Aktualisierung verworfen"; return 1; }
   done
   [[ -f "${SCRIPTS_SRC}/30-deploy-civitas.sh" ]] || return 1
 
-  # Neue Datei plus rename statt Ueberschreiben: bash liest das laufende Skript
-  # stueckweise nach und wuerde sonst mitten im Lauf in die neue Fassung springen.
+  # New file plus rename instead of overwriting: bash reads the running script
+  # in chunks and would otherwise jump into the new version mid-run.
   install -d -m 0755 "$SCRIPTS_DIR"
   for f in "$SCRIPTS_SRC"/*.sh; do
     name=$(basename "$f")
@@ -121,8 +121,8 @@ if $SELF_UPDATE && [[ -n "$SCRIPTS_REF" && -z "${CIVITAS_SCRIPTS_UPDATED:-}" ]];
   log "Skripte auf ${SCRIPTS_REF} aktualisieren (${SCRIPTS_REPO})"
   if update_scripts; then
     echo "  Stand: $(git -C "$SCRIPTS_SRC" log -1 --format='%h %s')"
-    # Mit der frischen Fassung von vorn beginnen. Die Markierung verhindert
-    # eine Schleife.
+    # Start over with the fresh version. The marker prevents
+    # a loop.
     exec env CIVITAS_SCRIPTS_UPDATED=1 bash "${SCRIPTS_DIR}/30-deploy-civitas.sh" "$@"
   fi
   warn "Aktualisierung fehlgeschlagen - es laeuft die lokale Fassung weiter."
@@ -138,25 +138,25 @@ EXTRA_HOSTS="${EXTRA_HOSTS:-}"
 
 NS="$INSTANCE_SLUG"
 CIVITAS_DIR="${CIVITAS_DIR:-/opt/civitas/civitas-core-deployment}"
-# Tag oder Branch, von dem deployt wird. Leer = Stand nehmen, der im Image
-# ausgecheckt ist. Sonst wird in der Arbeitskopie umgeschaltet, das Repo unter
-# CIVITAS_DIR bleibt unberuehrt.
+# Tag or branch to deploy from. Empty = use the revision checked out in the
+# image. Otherwise the working copy is switched, the repo under
+# CIVITAS_DIR stays untouched.
 CIVITAS_REF="${CIVITAS_REF:-}"
-# Oeffentliche Adresse, auf die die DNS-Namen zeigen, wenn die Instanz hinter
-# NAT steht. Leer = wird aus der DNS-Aufloesung abgeleitet.
+# Public address the DNS names point to when the instance sits behind
+# NAT. Empty = derived from DNS resolution.
 PUBLIC_IP="${PUBLIC_IP:-}"
 WORK_DIR="/opt/civitas/rendered"
-# Das gesamte Repo wird kopiert, nicht nur defaults/deployment: helmfile-root.yaml.gotmpl
-# liegt im Repo-Root, und defaults/deployment/*.yaml(.gotmpl) referenzieren es ueber
-# '../helmfile-root.yaml.gotmpl' - das funktioniert nur, wenn das Deployment-Verzeichnis
-# EINE Ebene direkt unter dem Repo-Root liegt, nicht zwei (wie defaults/deployment es tut).
-# Genau deshalb kopiert auch das offizielle justfile (Target "deploy") vor jedem Lauf
-# "defaults/deployment" nach "deployment" im Repo-Root - das bilden wir unten nach.
+# The whole repo is copied, not just defaults/deployment: helmfile-root.yaml.gotmpl
+# lives in the repo root, and defaults/deployment/*.yaml(.gotmpl) reference it via
+# '../helmfile-root.yaml.gotmpl' - that only works if the deployment directory sits
+# ONE level directly below the repo root, not two (as defaults/deployment does).
+# That is exactly why the official justfile (target "deploy") copies
+# "defaults/deployment" to "deployment" in the repo root before every run - we mirror that below.
 REPO_COPY="${WORK_DIR}/repo"
 DEPLOY_DIR="${REPO_COPY}/deployment"
-# Zwei Einstiegspunkte, in dieser Reihenfolge. helmfile.yaml im selben
-# Verzeichnis ist NICHT der richtige Einstieg - sie verweist auf eine
-# helmfile-root.yaml.gotmpl, die (nur) im Repo-Root liegt.
+# Two entry points, in this order. helmfile.yaml in the same
+# directory is NOT the right entry point - it refers to a
+# helmfile-root.yaml.gotmpl that lives (only) in the repo root.
 HELMFILE_OPERATORS="${DEPLOY_DIR}/helmfile-operators.yaml"
 HELMFILE_INSTANCE="${DEPLOY_DIR}/helmfile-instance.yaml.gotmpl"
 OPERATOR_NS="${OPERATOR_NS:-civitas-operators}"
@@ -168,9 +168,9 @@ if [[ -z "${NODE_IP:-}" ]]; then
 fi
 [[ -n "$NODE_IP" ]] || die "Node-IP konnte nicht ermittelt werden. NODE_IP in $ENV_FILE setzen."
 
-# Stimmt die Node-IP nicht mit der tatsaechlichen Adresse ueberein, hat k3s den
-# IP-Wechsel nach dem Klonen nicht mitbekommen. Der CoreDNS-Split-Horizon
-# weiter unten wuerde dann auf die alte Adresse zeigen.
+# If the node IP does not match the actual address, k3s missed the
+# IP change after cloning. The CoreDNS split horizon further down
+# would then point to the old address.
 HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
 if [[ -n "$HOST_IP" && "$HOST_IP" != "$NODE_IP" ]]; then
   die "k3s meldet Node-IP ${NODE_IP}, die Maschine hat aber ${HOST_IP}.
@@ -178,9 +178,9 @@ Erst korrigieren: sudo ./25-postclone-setup.sh --check
 Danach: sudo ./25-postclone-setup.sh --hostname \$(hostname) --ip ${HOST_IP}/<praefix> --gateway <gw> --dns <dns>"
 fi
 
-# Die Hostnamen kommen aus dem gerenderten Release (Schritt 3), damit neue
-# Hosts kuenftiger Versionen automatisch geprueft werden - so wie management
-# mit v2.0.0 dazukam. Diese Liste greift nur, wenn das nicht klappt.
+# The host names come from the rendered release (step 3), so that new
+# hosts of future versions are checked automatically - like management,
+# which was added in v2.0.0. This list only applies if that fails.
 FALLBACK_HOSTS=(api idm portal dashboard management)
 
 log "Konfiguration"
@@ -194,12 +194,12 @@ printf '  Oeffentliche IP : %s\n' "${PUBLIC_IP:-<aus DNS ableiten>}"
 printf '  Skript-Stand    : %s\n' "$(git -C "$SCRIPTS_SRC" log -1 --format='%h %s' 2>/dev/null || echo '<aus dem Image>')"
 
 # ---------------------------------------------------------------------------
-# 2 – Cluster-Voraussetzungen pruefen
+# 2 – Check cluster prerequisites
 # ---------------------------------------------------------------------------
 
-# Der Rollout laeuft viele Minuten ohne Ausgabe. Reisst die SSH-Sitzung ab,
-# stirbt helmfile mitten im Upgrade und hinterlaesst Releases in
-# pending-upgrade, die den naechsten Lauf blockieren.
+# The rollout runs for many minutes without output. If the SSH session drops,
+# helmfile dies mid-upgrade and leaves releases in
+# pending-upgrade that block the next run.
 if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
   warn "Der Rollout haengt an dieser SSH-Sitzung und dauert viele Minuten ohne Ausgabe."
   warn "Empfehlung: abbrechen und in 'tmux' erneut starten - tmux new -s deploy"
@@ -230,10 +230,10 @@ for check in "ingress-nginx:daemonset/ingress-nginx-controller" "cert-manager:de
 done
 echo "  ingress-nginx und cert-manager sind vorhanden."
 
-# Vorhanden heisst nicht bereit. Nach dem Klonen startet k3s alle Pods neu;
-# laeuft das Deployment zu frueh los, lehnt der API-Server den ClusterIssuer ab:
+# Present does not mean ready. After cloning k3s restarts all pods;
+# if the deployment starts too early, the API server rejects the ClusterIssuer:
 #   failed calling webhook ... cert-manager-webhook ... no endpoints available
-# Der Issuer wird dann nicht angelegt, und der naechste Schritt meldet NotFound.
+# The issuer is then not created, and the next step reports NotFound.
 log "Warten, bis cert-manager und ingress-nginx bereit sind"
 for d in cert-manager cert-manager-webhook cert-manager-cainjector; do
   "$KUBECTL" -n cert-manager rollout status "deployment/${d}" --timeout=300s >/dev/null 2>&1 \
@@ -242,8 +242,8 @@ done
 "$KUBECTL" -n ingress-nginx rollout status daemonset/ingress-nginx-controller --timeout=300s >/dev/null 2>&1 \
   || warn "  ingress-nginx-controller ist nach 5 Minuten nicht bereit"
 
-# Entscheidend ist der Endpoint hinter dem Webhook-Service, nicht der Pod-Status:
-# zwischen "Running" und "im Service eingetragen" liegen einige Sekunden.
+# What matters is the endpoint behind the webhook service, not the pod status:
+# there are a few seconds between "Running" and "registered in the service".
 webhook_ready=false
 for _ in $(seq 1 60); do
   eps=$("$KUBECTL" -n cert-manager get endpoints cert-manager-webhook \
@@ -262,7 +262,7 @@ Ursache ansehen:
 fi
 
 # ---------------------------------------------------------------------------
-# 3 – Release vorbereiten, pruefen und Hostnamen ableiten
+# 3 – Prepare and validate the release, derive host names
 # ---------------------------------------------------------------------------
 
 log "Deployment-Verzeichnis unter ${WORK_DIR} aufbauen"
@@ -271,7 +271,7 @@ mkdir -p "$WORK_DIR"
 rm -rf "$REPO_COPY"
 cp -a "$CIVITAS_DIR" "$REPO_COPY"
 
-# Auf einen anderen Tag oder Branch umschalten - nur in der Arbeitskopie.
+# Switch to a different tag or branch - only in the working copy.
 if [[ -n "$CIVITAS_REF" ]]; then
   log "Auf ${CIVITAS_REF} umschalten"
   git config --global --add safe.directory "$REPO_COPY" 2>/dev/null || true
@@ -283,8 +283,8 @@ if [[ -n "$CIVITAS_REF" ]]; then
   fi
 
   target="$CIVITAS_REF"
-  # Branchnamen auf den Remote-Stand aufloesen, sonst landet man auf einem
-  # veralteten lokalen Branch aus der Zeit des Image-Baus.
+  # Resolve branch names to the remote state, otherwise you end up on a
+  # stale local branch from the time the image was built.
   if git -C "$REPO_COPY" rev-parse --verify --quiet "refs/remotes/origin/${CIVITAS_REF}" >/dev/null; then
     target="origin/${CIVITAS_REF}"
   fi
@@ -297,9 +297,9 @@ $(git -C "$REPO_COPY" branch -r | sed 's/^/  /')"
   echo "  jetzt auf: $(git -C "$REPO_COPY" describe --tags --always 2>/dev/null) ($(git -C "$REPO_COPY" log -1 --format=%h\ %s))"
 fi
 
-# Wie im offiziellen justfile (Target "deploy"): defaults/deployment nach deployment/
-# im Repo-Root kopieren, damit '../helmfile-root.yaml.gotmpl' aus den Helmfiles dort
-# auf das tatsaechlich vorhandene helmfile-root.yaml.gotmpl im Repo-Root zeigt.
+# As in the official justfile (target "deploy"): copy defaults/deployment to deployment/
+# in the repo root, so that '../helmfile-root.yaml.gotmpl' in the helmfiles there
+# points to the helmfile-root.yaml.gotmpl that actually exists in the repo root.
 [[ -d "${REPO_COPY}/defaults/deployment" ]] \
   || die "${REPO_COPY}/defaults/deployment fehlt - die Repo-Struktur weicht von der erwarteten ab."
 rm -rf "$DEPLOY_DIR"
@@ -333,10 +333,10 @@ global:
 EOF
 echo "  global.yaml.gotmpl geschrieben"
 
-# Vorabpruefung: das Release muss sich mit den installierten Tools rendern
-# lassen, BEVOR irgendetwas am Cluster passiert (Reset, Issuer, Namespace).
-# Passen ein kuenftiges Release und die Tool-Versionen im Image nicht
-# zusammen, faellt das hier auf und nicht mitten im Rollout.
+# Pre-check: the release must render with the installed tools
+# BEFORE anything happens to the cluster (reset, issuer, namespace).
+# If a future release and the tool versions in the image don't
+# match, this is caught here and not in the middle of the rollout.
 log "Release rendern (Vorabpruefung, laedt beim ersten Mal die Charts)"
 RENDERED="${WORK_DIR}/instance-rendered.yaml"
 RENDER_LOG="${WORK_DIR}/instance-render.log"
@@ -349,8 +349,8 @@ im Image (helmfile --version, helm version), geaenderte Repo-Struktur."
 fi
 echo "  $(grep -c '^kind:' "$RENDERED") Objekte gerendert"
 
-# Alle Hostnamen aus den Ingresses des Releases. Sie landen gemeinsam in einem
-# Zertifikat - fehlt einer im DNS, scheitert die Challenge fuer alle.
+# All host names from the release's ingresses. They end up together in one
+# certificate - if one is missing from DNS, the challenge fails for all of them.
 mapfile -t HOST_FQDNS < <(awk '
   /^---/ { ing = 0; next }
   /^kind:[[:space:]]*Ingress[[:space:]]*$/ { ing = 1; next }
@@ -370,20 +370,20 @@ echo "  Hostnamen dieses Releases:"
 printf '    %s\n' "${HOST_FQDNS[@]}"
 
 # ---------------------------------------------------------------------------
-# 3b – Oeffentliche DNS-Aufloesung
+# 3b – Public DNS resolution
 # ---------------------------------------------------------------------------
 
-# Zwei gueltige Betriebsarten:
+# Two valid modes:
 #
-#   direkt  Die Namen zeigen auf die Node-IP. Nur moeglich, wenn die VM selbst
-#           aus dem Internet erreichbar ist.
-#   NAT     Die Namen zeigen auf eine oeffentliche Adresse, die der Hypervisor
-#           bzw. die Firewall auf die private Node-IP abbildet. Das ist der
-#           Normalfall in einem Rechenzentrumsnetz - und dann ist eine
-#           Abweichung von der Node-IP KEIN Fehler.
+#   direct  The names point to the node IP. Only possible if the VM itself
+#           is reachable from the internet.
+#   NAT     The names point to a public address that the hypervisor
+#           or firewall maps to the private node IP. This is the
+#           normal case in a data center network - and then a
+#           mismatch with the node IP is NOT an error.
 #
-# Entscheidend fuer die HTTP-01-Challenge ist nur, dass alle Namen einheitlich
-# auf dieselbe Adresse zeigen und dass Port 80 von aussen dort ankommt.
+# All that matters for the HTTP-01 challenge is that all names consistently
+# point to the same address and that port 80 reaches it from outside.
 log "Oeffentliche DNS-Aufloesung pruefen"
 
 declare -A seen=()
@@ -422,9 +422,9 @@ else
 fi
 
 if $dns_ok; then
-  # Der Test laeuft von der VM aus und damit ueber Hairpin-NAT, das viele
-  # Firewalls nicht beherrschen. Ein Fehlschlag sagt hier also wenig - deshalb
-  # nur als Hinweis, nie als Abbruchgrund.
+  # The test runs from the VM and thus via hairpin NAT, which many
+  # firewalls don't support. A failure here says little - so it is
+  # only a hint, never a reason to abort.
   if [[ -n "${TARGET_ADDR:-}" && "$TARGET_ADDR" != "$NODE_IP" ]]; then
     if curl -sS -o /dev/null --max-time 10 "http://${TARGET_ADDR}/.well-known/acme-challenge/probe" 2>/dev/null; then
       echo "  Port 80 auf ${TARGET_ADDR} antwortet"
@@ -471,7 +471,7 @@ fi
 # ---------------------------------------------------------------------------
 
 log "ClusterIssuer letsencrypt-prod"
-apply_with_retry() {  # liest das Manifest von stdin
+apply_with_retry() {  # reads the manifest from stdin
   local manifest attempt
   manifest=$(cat)
   for attempt in 1 2 3; do
@@ -486,8 +486,8 @@ if [[ "$LETSENCRYPT_STAGING" == "true" ]]; then
 else
   ACME_SERVER="https://acme-v02.api.letsencrypt.org/directory"
 fi
-# Der Name bleibt bewusst letsencrypt-prod, weil die CIVITAS-Ingresses ihn
-# referenzieren. Nur der ACME-Endpunkt wechselt.
+# The name deliberately stays letsencrypt-prod, because the CIVITAS ingresses
+# reference it. Only the ACME endpoint changes.
 cat <<EOF | apply_with_retry
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -504,8 +504,8 @@ spec:
           ingress:
             ingressClassName: nginx
 EOF
-# apply_with_retry gibt bei Misserfolg nicht 0 zurueck - ohne Issuer ist jedes
-# weitere Ausrollen sinnlos, weil kein Zertifikat ausgestellt werden kann.
+# apply_with_retry returns non-zero on failure - without an issuer any
+# further rollout is pointless, because no certificate can be issued.
 [[ $? -eq 0 ]] || die "ClusterIssuer konnte nicht angelegt werden.
 Meist ist der cert-manager-Webhook nicht erreichbar:
   kubectl -n cert-manager get pods
@@ -515,7 +515,7 @@ Meist ist der cert-manager-Webhook nicht erreichbar:
   || warn "ClusterIssuer noch nicht Ready - kubectl describe clusterissuer letsencrypt-prod"
 
 # ---------------------------------------------------------------------------
-# 6 – CoreDNS Split-Horizon
+# 6 – CoreDNS split horizon
 # ---------------------------------------------------------------------------
 
 apply_coredns_hosts() {  # $@ = FQDNs
@@ -523,20 +523,20 @@ apply_coredns_hosts() {  # $@ = FQDNs
   for fqdn in "$@"; do
     entries+="        ${NODE_IP} ${fqdn}"$'\n'
   done
-  # In k3s NICHT die coredns-ConfigMap editieren - die wird vom Auto-Deploy-
-  # Controller beim Neustart ueberschrieben. Der vorgesehene Weg ist die
-  # ConfigMap coredns-custom, die das Corefile per import einbindet.
+  # In k3s do NOT edit the coredns ConfigMap - it is overwritten by the auto-deploy
+  # controller on restart. The intended way is the
+  # ConfigMap coredns-custom, which the Corefile pulls in via import.
   #
-  # WICHTIG: Schluessel auf .server, nicht auf .override. Ein .override landet
-  # im bestehenden .:53-Block, und dort steht bereits
+  # IMPORTANT: key ending in .server, not .override. An .override lands
+  # in the existing .:53 block, which already contains
   #   hosts /etc/coredns/NodeHosts
-  # aus dem k3s-Standard-Corefile. CoreDNS bricht dann beim Start ab mit
+  # from the k3s default Corefile. CoreDNS then aborts on start with
   #   plugin/hosts: this plugin can only be used once per Server Block
-  # Ein .server erzeugt stattdessen einen eigenen Server-Block fuer die Domain,
-  # in dem hosts nur einmal vorkommt.
+  # A .server instead creates a separate server block for the domain,
+  # in which hosts appears only once.
   #
-  # fallthrough + forward sorgen dafuer, dass alle anderen Namen unter dieser
-  # Domain weiterhin ueber den normalen Resolver aufgeloest werden.
+  # fallthrough + forward make sure all other names under this
+  # domain are still resolved via the normal resolver.
   cat <<EOF | "$KUBECTL" apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -554,8 +554,8 @@ ${entries}        fallthrough
       forward . /etc/resolv.conf
     }
 EOF
-  # Rueckstaende aus aelteren Laeufen entfernen, sonst wird weiterhin ein
-  # zweiter hosts-Block in den .:53-Block importiert.
+  # Remove leftovers from older runs, otherwise a second hosts block
+  # keeps being imported into the .:53 block.
   "$KUBECTL" -n kube-system patch cm coredns-custom --type=json \
     -p='[{"op":"remove","path":"/data/civitas.override"}]' >/dev/null 2>&1 || true
 
@@ -569,12 +569,12 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 5b – Wechsel zwischen Staging und Produktion
+# 5b – Switching between staging and production
 #
-# cert-manager erneuert ein Zertifikat NICHT, nur weil der ACME-Endpunkt sich
-# geaendert hat - das vorhandene Secret ist ja formal noch gueltig. Beim
-# Wechsel muessen die TLS-Secrets deshalb weg, sonst bleibt das alte
-# Zertifikat liegen und NiFi scheitert weiter am Truststore.
+# cert-manager does NOT renew a certificate just because the ACME endpoint
+# changed - the existing secret is still formally valid. On a
+# switch the TLS secrets therefore have to go, otherwise the old
+# certificate stays and NiFi keeps failing on the truststore.
 # ---------------------------------------------------------------------------
 
 log "Vorhandene Zertifikate gegen den ACME-Modus pruefen"
@@ -604,7 +604,7 @@ apply_coredns_hosts "${HOST_FQDNS[@]}" || die "CoreDNS-Konfiguration fehlgeschla
 printf '  %s\n' "${HOST_FQDNS[@]}"
 
 # ---------------------------------------------------------------------------
-# 7 – Namespace und Secrets
+# 7 – Namespace and secrets
 # ---------------------------------------------------------------------------
 
 log "Namespace ${NS}"
@@ -625,11 +625,11 @@ else
 fi
 
 log "Secret custom-ca-cert (Truststore fuer NiFi)"
-# NiFi prueft ausgehende TLS-Verbindungen gegen diesen Truststore. Enthaelt er
-# die falsche Wurzel, stirbt der Pod in CrashLoopBackOff mit
+# NiFi checks outgoing TLS connections against this truststore. If it contains
+# the wrong root, the pod dies in CrashLoopBackOff with
 #   SunCertPathBuilderException: unable to find valid certification path
-# Im Staging-Modus wird nicht von ISRG signiert, sondern von der Staging-CA -
-# deren Wurzel muss dann zusaetzlich hinein.
+# In staging mode certificates are not signed by ISRG but by the staging CA -
+# its root then has to be added as well.
 [[ -f "$ISRG_PEM" ]] || curl -fsSL -o "$ISRG_PEM" https://letsencrypt.org/certs/isrgrootx1.pem
 CA_BUNDLE="$ISRG_PEM"
 if [[ "$LETSENCRYPT_STAGING" == "true" ]]; then
@@ -668,8 +668,8 @@ if ! helmfile -f "$HELMFILE_OPERATORS" sync -e production; then
   cd ${DEPLOY_DIR} && sudo helmfile -f helmfile-operators.yaml -e production --log-level debug sync"
 fi
 
-# Die Operatoren bringen Admission-Webhooks mit. Startet der Instanz-Teil zu
-# frueh, scheitert das Release postgres-cluster reproduzierbar mit
+# The operators bring admission webhooks. If the instance part starts too
+# early, the postgres-cluster release reproducibly fails with
 #   failed calling webhook "mcluster.cnpg.io" ... context deadline exceeded
 log "Warten, bis die Operator-Webhooks bereit sind"
 if "$KUBECTL" -n "$OPERATOR_NS" wait --for=condition=Available deploy --all --timeout=300s >/dev/null 2>&1; then
@@ -692,8 +692,8 @@ CNPG-Operator noch nicht bereit. Pruefen mit:
 und danach dieses Skript erneut aufrufen."
 fi
 
-# helmfile beendet sich auch dann mit 0, wenn es gar keine Releases gefunden
-# hat - etwa bei abweichender Repo-Struktur oder falschem Environment.
+# helmfile also exits with 0 if it found no releases at all
+# - e.g. with a different repo structure or the wrong environment.
 releases=$(helm list -n "$NS" -q 2>/dev/null | wc -l)
 if (( releases == 0 )); then
   warn "helmfile lief durch, aber im Namespace ${NS} existiert kein Release."
@@ -704,7 +704,7 @@ fi
 echo "  ${releases} Release(s) im Namespace ${NS}"
 
 # ---------------------------------------------------------------------------
-# 9 – CoreDNS aus den echten Ingresses nachziehen
+# 9 – Update CoreDNS from the actual ingresses
 # ---------------------------------------------------------------------------
 
 log "CoreDNS-Eintraege aus den tatsaechlichen Ingresses aktualisieren"
@@ -719,7 +719,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 10 – Verifikation
+# 10 – Verification
 # ---------------------------------------------------------------------------
 
 log "Warte auf Zertifikate (bis zu 10 Minuten)"

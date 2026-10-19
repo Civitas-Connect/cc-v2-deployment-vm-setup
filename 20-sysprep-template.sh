@@ -2,33 +2,33 @@
 #
 # 20-sysprep-template.sh
 #
-# Versiegelt die laufende Master-VM fuer einen Snapshot.
+# Seals the running master VM for a snapshot.
 #
-# Unterschied zur klassischen Variante: hier wird NICHTS geloescht, was die
-# laufende Maschine sofort braucht. machine-id, SSH-Host-Keys, Hostname und
-# Netzwerkkonfiguration bleiben unangetastet. Stattdessen wird eine Markierung
-# (/etc/civitas/sealed) gesetzt, die civitas-firstboot.service beim naechsten
-# Boot auswertet - in jedem Klon und, nach dem naechsten Reboot, auch im Master.
+# Difference to the classic approach: NOTHING the running machine needs right
+# now is deleted. machine-id, SSH host keys, hostname and network
+# configuration stay untouched. Instead a marker (/etc/civitas/sealed) is set,
+# which civitas-firstboot.service evaluates on the next boot - in every clone
+# and, after its next reboot, in the master as well.
 #
-# Damit gilt: der Master muss zum Snapshot NICHT heruntergefahren werden.
-# Genau das setzen Hypervisoren wie Nutanix AHV voraus.
+# This means: the master does NOT have to be shut down for the snapshot.
+# Which is exactly what hypervisors like Nutanix AHV expect.
 #
-# Was hier trotzdem passiert:
-#   - k3s wird gestoppt, damit der SQLite-Datastore im Snapshot konsistent ist
-#   - Zugangsdaten und Instanz-Artefakte werden entfernt
-#   - Logs, Caches und Shell-Historie werden geleert
-#   - fstrim gibt freien Speicher zurueck, der Snapshot wird kleiner
+# What still happens here:
+#   - k3s is stopped so the SQLite datastore in the snapshot is consistent
+#   - credentials and instance artifacts are removed
+#   - logs, caches and shell history are cleared
+#   - fstrim returns free space, making the snapshot smaller
 #
-# Aufruf:
-#   sudo ./20-sysprep-template.sh                   # Cluster bleibt im Image (empfohlen)
-#   sudo ./20-sysprep-template.sh --reset-cluster   # Cluster-State verwerfen
-#   sudo ./20-sysprep-template.sh --reboot          # nach dem Versiegeln neu starten
+# Usage:
+#   sudo ./20-sysprep-template.sh                   # cluster stays in the image (recommended)
+#   sudo ./20-sysprep-template.sh --reset-cluster   # discard cluster state
+#   sudo ./20-sysprep-template.sh --reboot          # reboot after sealing
 #
-# Reihenfolge im Normalfall:
+# Normal order:
 #   1. sudo ./20-sysprep-template.sh
-#   2. Snapshot der LAUFENDEN VM im Hypervisor ziehen
-#   3. sudo reboot            -> der Master personalisiert sich selbst neu
-#   4. sudo ./25-postclone-setup.sh ...   -> Hostname und feste IP zurueckgeben
+#   2. take a snapshot of the RUNNING VM in the hypervisor
+#   3. sudo reboot            -> the master re-personalizes itself
+#   4. sudo ./25-postclone-setup.sh ...   -> restore hostname and static IP
 #
 
 set -uo pipefail
@@ -50,7 +50,7 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# 0 – Voraussetzungen
+# 0 – Prerequisites
 # ---------------------------------------------------------------------------
 
 [[ -x /usr/local/sbin/civitas-firstboot.sh ]] \
@@ -65,8 +65,8 @@ systemctl is-enabled civitas-clusterfix.service >/dev/null 2>&1 \
 [[ -f /etc/netplan/01-civitas-dhcp.yaml ]] \
   || warn "Kein DHCP-Fallback unter /etc/netplan/01-civitas-dhcp.yaml. Klone kommen dann nur ueber die Konsole ans Netz."
 
-# Nach einem Snapshot-Restore laeuft die Uhr einer VM haeufig falsch. k3s
-# lehnt dann seine eigenen Zertifikate ab. Besser jetzt auffallen als im Klon.
+# After a snapshot restore a VM's clock is often wrong. k3s then rejects
+# its own certificates. Better to notice now than in the clone.
 if ! timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
   warn "Systemzeit ist nicht synchronisiert. Klone koennen dadurch k3s-Zertifikatsfehler bekommen."
   warn "Vorher pruefen: timedatectl && systemctl restart systemd-timesyncd"
@@ -97,7 +97,7 @@ read -r -p "Fortfahren? [ja/NEIN] " answer
 [[ "$answer" == "ja" ]] || die "Abgebrochen."
 
 # ---------------------------------------------------------------------------
-# 1 – Netzkonfiguration des Masters sichern
+# 1 – Back up the master's network configuration
 # ---------------------------------------------------------------------------
 
 BACKUP="/root/civitas-master-netz-$(date +%Y%m%d-%H%M%S)"
@@ -111,12 +111,12 @@ echo "  Diese Dateien liegen NUR im Master und wandern mit in den Snapshot -"
 echo "  civitas-firstboot loescht sie im Klon nicht, sie sind aber auch nicht aktiv."
 
 # ---------------------------------------------------------------------------
-# 2 – Cluster sauber anhalten
+# 2 – Stop the cluster cleanly
 # ---------------------------------------------------------------------------
 
 log "k3s stoppen"
-# Der Dienst muss aktiviert BLEIBEN, sonst kommt der Cluster nach dem Boot
-# des Klons gar nicht hoch und 25-postclone-setup.sh wartet ins Leere.
+# The service must STAY enabled, otherwise the cluster never comes up after
+# the clone boots and 25-postclone-setup.sh waits forever.
 systemctl enable k3s >/dev/null 2>&1 || true
 systemctl stop k3s 2>/dev/null || true
 [[ -x /usr/local/bin/k3s-killall.sh ]] && /usr/local/bin/k3s-killall.sh >/dev/null 2>&1 || true
@@ -139,11 +139,11 @@ else
   rm -rf /var/log/pods/* /var/log/containers/* 2>/dev/null || true
 fi
 
-# Der Image-Store bleibt in beiden Faellen erhalten - er ist node-unabhaengig
-# und der eigentliche Grund, warum das Template schnell ist.
+# The image store is kept in both cases - it is node-independent
+# and the actual reason why the template is fast.
 
 # ---------------------------------------------------------------------------
-# 3 – Instanzspezifische Artefakte entfernen
+# 3 – Remove instance-specific artifacts
 # ---------------------------------------------------------------------------
 
 log "Deployment-Konfiguration mit Zugangsdaten entfernen"
@@ -151,7 +151,7 @@ rm -f /etc/civitas/deploy.env
 rm -rf /opt/civitas/rendered
 
 # ---------------------------------------------------------------------------
-# 4 – Logs, Caches, Historie
+# 4 – Logs, caches, history
 # ---------------------------------------------------------------------------
 
 log "Logs und Caches leeren"
@@ -175,7 +175,7 @@ done
 history -c 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 5 – Versiegeln
+# 5 – Seal
 # ---------------------------------------------------------------------------
 
 log "Image versiegeln"
@@ -190,11 +190,11 @@ systemctl enable civitas-firstboot.service >/dev/null 2>&1 || true
 echo "  /etc/civitas/sealed gesetzt - civitas-firstboot greift beim naechsten Boot"
 
 # ---------------------------------------------------------------------------
-# 6 – Speicher zurueckgeben und Puffer auf die Platte zwingen
+# 6 – Return free space and flush buffers to disk
 # ---------------------------------------------------------------------------
 
-# Ein Zertifikat mit Zukunftsdatum wandert sonst ins Image und macht jeden
-# Klon unbrauchbar, sobald NTP die Uhr korrigiert.
+# Otherwise a certificate dated in the future ends up in the image and breaks
+# every clone as soon as NTP corrects the clock.
 crt=/var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt
 if [[ -f "$crt" ]]; then
   nb=$(openssl x509 -in "$crt" -noout -startdate 2>/dev/null | cut -d= -f2)
@@ -208,8 +208,8 @@ log "fstrim"
 fstrim -av 2>/dev/null || warn "fstrim nicht moeglich (kein TRIM-faehiges Volume)."
 
 log "Dateisystem-Puffer schreiben"
-# Ein Live-Snapshot ist nur crash-konsistent. sync verringert das Risiko,
-# dass halb geschriebene Bloecke im Snapshot landen.
+# A live snapshot is only crash-consistent. sync reduces the risk of
+# half-written blocks ending up in the snapshot.
 sync; sync
 echo 3 >/proc/sys/vm/drop_caches 2>/dev/null || true
 
